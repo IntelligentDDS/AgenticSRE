@@ -1,0 +1,153 @@
+# ═══════════════════════════════════════════
+# AgenticSRE Evaluation Task Definitions
+# ═══════════════════════════════════════════
+
+# Fault injection scenarios for evaluating the RCA pipeline.
+# Each task defines: fault injection command, expected root cause, validation criteria.
+
+tasks:
+  # ── CPU Stress ──
+  - id: cpu-stress-001
+    name: "CPU Stress Test"
+    category: resource
+    fault_type: cpu_pressure
+    description: "Inject CPU stress on a pod to verify metric anomaly detection"
+    inject:
+      method: kubectl
+      commands:
+        - "kubectl run cpu-stress --image=busybox --restart=Never -- /bin/sh -c 'while true; do :; done'"
+      namespace: default
+      cleanup:
+        - "kubectl delete pod cpu-stress --force --grace-period=0"
+    expected:
+      root_cause_contains: ["cpu", "stress", "resource", "throttl"]
+      fault_type: "resource_exhaustion"
+      affected_services: ["cpu-stress"]
+    validation:
+      max_detection_time_s: 120
+      min_confidence: 0.6
+      require_remediation_suggestion: true
+
+  # ── Memory Pressure ──
+  - id: mem-pressure-001
+    name: "Memory Pressure Test"
+    category: resource
+    fault_type: memory_pressure
+    description: "Inject memory stress to verify OOMKill detection"
+    inject:
+      method: kubectl
+      commands:
+        - "kubectl run mem-stress --image=busybox --restart=Never --limits='memory=64Mi' -- /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=1M'"
+      namespace: default
+      cleanup:
+        - "kubectl delete pod mem-stress --force --grace-period=0"
+    expected:
+      root_cause_contains: ["memory", "oom", "pressure", "limit"]
+      fault_type: "resource_exhaustion"
+    validation:
+      max_detection_time_s: 120
+      min_confidence: 0.5
+
+  # ── Pod CrashLoop ──
+  - id: crashloop-001
+    name: "CrashLoopBackOff Test"
+    category: application
+    fault_type: crash_loop
+    description: "Deploy a failing pod to test crash detection"
+    inject:
+      method: kubectl
+      commands:
+        - "kubectl run crash-test --image=busybox --restart=Always -- /bin/sh -c 'exit 1'"
+      namespace: default
+      cleanup:
+        - "kubectl delete pod crash-test --force --grace-period=0"
+    expected:
+      root_cause_contains: ["crash", "restart", "exit", "backoff"]
+      fault_type: "application_crash"
+    validation:
+      max_detection_time_s: 180
+      min_confidence: 0.5
+
+  # ── Image Pull Error ──
+  - id: imagepull-001
+    name: "ImagePullBackOff Test"
+    category: configuration
+    fault_type: image_pull_error
+    description: "Deploy with invalid image to test event detection"
+    inject:
+      method: kubectl
+      commands:
+        - "kubectl run bad-image --image=nonexistent-registry.io/fake-image:v999 --restart=Never"
+      namespace: default
+      cleanup:
+        - "kubectl delete pod bad-image --force --grace-period=0"
+    expected:
+      root_cause_contains: ["image", "pull", "registry", "not found"]
+      fault_type: "configuration_error"
+    validation:
+      max_detection_time_s: 90
+      min_confidence: 0.7
+
+  # ── Service Endpoint Down ──
+  - id: svc-down-001
+    name: "Service Endpoint Down"
+    category: network
+    fault_type: service_unavailable
+    description: "Scale a deployment to 0 replicas to test service availability detection"
+    inject:
+      method: kubectl
+      commands:
+        - "kubectl create deployment svc-test --image=nginx --replicas=1"
+        - "kubectl expose deployment svc-test --port=80"
+        - "sleep 30"
+        - "kubectl scale deployment svc-test --replicas=0"
+      namespace: default
+      cleanup:
+        - "kubectl delete deployment svc-test"
+        - "kubectl delete service svc-test"
+    expected:
+      root_cause_contains: ["endpoint", "replica", "scale", "unavailable"]
+      fault_type: "service_disruption"
+    validation:
+      max_detection_time_s: 120
+      min_confidence: 0.5
+
+  # ── Node Pressure (Disk) ──
+  - id: disk-pressure-001
+    name: "Disk Pressure Simulation"
+    category: infrastructure
+    fault_type: disk_pressure
+    description: "Fill /tmp to simulate disk pressure taint"
+    inject:
+      method: ssh
+      commands:
+        - "dd if=/dev/zero of=/tmp/fill_disk bs=1M count=5000"
+      cleanup:
+        - "rm -f /tmp/fill_disk"
+    expected:
+      root_cause_contains: ["disk", "pressure", "storage", "space"]
+      fault_type: "infrastructure"
+    validation:
+      max_detection_time_s: 180
+      min_confidence: 0.4
+
+# ── Alert Compression Evaluation ──
+alert_compression:
+  target_accuracy: 0.80
+  scenarios:
+    - id: alert-multi-001
+      name: "Multi-source alert compression"
+      description: "Verify alert grouping from concurrent failures"
+      inject_faults:
+        - "kubectl run ac-cpu --image=busybox --restart=Never -- /bin/sh -c 'while true; do :; done'"
+        - "kubectl run ac-crash --image=busybox --restart=Always -- /bin/sh -c 'exit 1'"
+        - "kubectl run ac-image --image=fake-image:v999 --restart=Never"
+      expected_groups: 3
+      max_groups: 5
+
+# ── Scoring Weights ──
+scoring:
+  detection_time_weight: 0.2
+  confidence_weight: 0.3
+  root_cause_match_weight: 0.3
+  remediation_quality_weight: 0.2

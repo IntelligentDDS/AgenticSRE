@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgenticSRE Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Sidebar -->
+    <nav class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h1>🤖 AgenticSRE</h1>
+            <span class="version">v1.0</span>
+        </div>
+        <ul class="nav-list">
+            <li class="nav-item active" data-view="overview">📊 集群概览</li>
+            <li class="nav-item" data-view="metrics">📈 指标监控</li>
+            <li class="nav-item" data-view="logs">📋 日志查询</li>
+            <li class="nav-item" data-view="alerts">🔔 告警中心</li>
+            <li class="nav-item" data-view="rca">🔍 根因分析</li>
+            <li class="nav-item" data-view="traces">🔗 链路追踪</li>
+            <li class="nav-item" data-view="daemon">🤖 守护进程</li>
+            <li class="nav-item" data-view="events">📅 事件追踪</li>
+        </ul>
+        <div class="sidebar-footer">
+            <div class="health-indicator" id="health-dot">
+                <span class="dot dot-green"></span>
+                <span>系统正常</span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <!-- LLM API Key Warning Banner -->
+        <div id="llm-warning" class="llm-warning" style="display:none;">
+            <span class="llm-warning-icon">⚠️</span>
+            <span class="llm-warning-text">
+                <strong>LLM API Key 未配置</strong> — RCA 根因分析、告警压缩等核心功能不可用。请在 <code>.env</code> 文件中设置 <code>LLM_API_KEY</code>，然后重启服务。
+            </span>
+            <button class="llm-warning-close" onclick="this.parentElement.style.display='none'">&times;</button>
+        </div>
+
+        <!-- Header Bar -->
+        <header class="topbar">
+            <div class="topbar-left">
+                <button class="btn-icon" id="toggle-sidebar">☰</button>
+                <h2 id="view-title">集群概览</h2>
+            </div>
+            <div class="topbar-right">
+                <span class="badge badge-info" id="cluster-badge">集群连接中...</span>
+                <select id="refresh-interval" class="select-sm">
+                    <option value="0">手动刷新</option>
+                    <option value="10" selected>10秒</option>
+                    <option value="30">30秒</option>
+                    <option value="60">60秒</option>
+                </select>
+                <button class="btn btn-sm" onclick="refreshCurrentView()">🔄 刷新</button>
+            </div>
+        </header>
+
+        <!-- ═══ Overview Section ═══ -->
+        <section id="view-overview" class="view active">
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">节点数</div>
+                    <div class="stat-value" id="stat-nodes">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Pod总数</div>
+                    <div class="stat-value" id="stat-pods">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">命名空间</div>
+                    <div class="stat-value" id="stat-ns">-</div>
+                </div>
+                <div class="stat-card accent">
+                    <div class="stat-label">重启次数</div>
+                    <div class="stat-value" id="stat-restarts">-</div>
+                </div>
+            </div>
+
+            <div class="grid-2col">
+                <div class="card">
+                    <h3>节点状态</h3>
+                    <div id="node-grid" class="node-grid"></div>
+                </div>
+                <div class="card">
+                    <h3>Pod状态分布</h3>
+                    <canvas id="pod-chart" width="300" height="200"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>最近告警</h3>
+                <div id="alert-preview"></div>
+            </div>
+        </section>
+
+        <!-- ═══ Metrics Section ═══ -->
+        <section id="view-metrics" class="view">
+            <!-- Namespace filter -->
+            <div class="filter-row">
+                <select id="metrics-ns" class="select-sm" onchange="loadMetrics()">
+                    <option value="">所有命名空间</option>
+                </select>
+                <button class="btn btn-sm btn-primary" onclick="loadMetrics()">🔄 刷新指标</button>
+            </div>
+
+            <!-- Node-level metrics -->
+            <div class="grid-2col">
+                <div class="card">
+                    <h3>节点 CPU 使用率 (%)</h3>
+                    <div id="metrics-node-cpu" class="metrics-bars"></div>
+                </div>
+                <div class="card">
+                    <h3>节点内存使用率 (%)</h3>
+                    <div id="metrics-node-memory" class="metrics-bars"></div>
+                </div>
+            </div>
+            <div class="card">
+                <h3>节点磁盘使用率 (%)</h3>
+                <div id="metrics-node-disk" class="metrics-bars"></div>
+            </div>
+
+            <!-- Container top CPU/Memory -->
+            <div class="grid-2col">
+                <div class="card">
+                    <h3>容器 CPU Top10 (cores %)</h3>
+                    <table class="data-table" id="metrics-cpu-top">
+                        <thead><tr><th>Pod</th><th>命名空间</th><th>CPU %</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="card">
+                    <h3>容器内存 Top10 (MB)</h3>
+                    <table class="data-table" id="metrics-mem-top">
+                        <thead><tr><th>Pod</th><th>命名空间</th><th>内存 MB</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Custom PromQL query -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>PromQL 查询</h3>
+                </div>
+                <div class="filter-row">
+                    <input type="text" id="promql-input" class="input-sm" style="flex:1" placeholder="输入 PromQL，例如: up">
+                    <select id="promql-type" class="select-sm">
+                        <option value="instant">即时查询</option>
+                        <option value="range">范围查询</option>
+                    </select>
+                    <button class="btn btn-sm btn-primary" onclick="runPromQL()">执行</button>
+                </div>
+                <pre class="log-viewer" id="promql-result" style="max-height:300px;overflow:auto">输入 PromQL 查询后点击执行...</pre>
+            </div>
+
+            <!-- Pod table -->
+            <div class="card">
+                <h3>Pod 状态统计</h3>
+                <table class="data-table" id="pod-table">
+                    <thead>
+                        <tr><th>名称</th><th>命名空间</th><th>状态</th><th>Ready</th><th>重启</th><th>节点</th></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- ═══ Logs Section ═══ -->
+        <section id="view-logs" class="view">
+            <div class="filter-row">
+                <select id="log-ns" class="select-sm" onchange="loadPodsByNs()">
+                    <option value="">选择命名空间</option>
+                </select>
+                <select id="log-pod" class="select-sm">
+                    <option value="">选择Pod</option>
+                </select>
+                <input type="number" id="log-lines" class="input-sm" value="200" placeholder="行数">
+                <button class="btn btn-sm btn-primary" onclick="fetchLogs()">查询</button>
+            </div>
+            <div class="card">
+                <pre class="log-viewer" id="log-content">选择Pod后点击查询...</pre>
+            </div>
+        </section>
+
+        <!-- ═══ Alerts Section ═══ -->
+        <section id="view-alerts" class="view">
+            <!-- 检测配置面板 -->
+            <details class="card" id="detection-config-panel">
+                <summary class="card-header" style="cursor:pointer"><h3>⚙️ 检测配置</h3></summary>
+                <div style="padding:16px">
+                    <!-- 告警源开关 -->
+                    <h4 style="margin-bottom:8px">告警源</h4>
+                    <div id="source-toggles" class="filter-row"></div>
+                    <!-- 类别检测开关 -->
+                    <h4 style="margin:12px 0 8px">内置类别检测</h4>
+                    <div id="category-toggles" class="filter-row"></div>
+                    <!-- 业务服务名称 -->
+                    <h4 style="margin:12px 0 8px">业务服务名称 (Business Services)</h4>
+                    <div id="business-services-tags" class="filter-row" style="flex-wrap:wrap;gap:4px"></div>
+                    <!-- 数据库服务名称 -->
+                    <h4 style="margin:12px 0 8px">数据库服务名称 (DB Services)</h4>
+                    <div id="db-services-tags" class="filter-row" style="flex-wrap:wrap;gap:4px"></div>
+                    <!-- 严重性判定规则 -->
+                    <h4 style="margin:12px 0 8px">严重事件原因 (critical_event_reasons)</h4>
+                    <div id="critical-event-reasons" class="filter-row"></div>
+                    <h4 style="margin:12px 0 8px">严重Pod原因 (critical_pod_reasons)</h4>
+                    <div id="critical-pod-reasons" class="filter-row"></div>
+                    <!-- 指标检查列表 -->
+                    <h4 style="margin:12px 0 8px">异常检测指标</h4>
+                    <table class="data-table" id="metric-checks-table">
+                        <thead><tr><th>名称</th><th>级别</th><th>Warning</th><th>Critical</th><th>单位</th><th>检测算法</th><th>操作</th></tr></thead>
+                        <tbody id="metric-checks-body"></tbody>
+                    </table>
+                    <button class="btn btn-sm" onclick="addMetricCheck()" style="margin-top:8px">+ 添加指标</button>
+                    <!-- 全局算法参数 -->
+                    <h4 style="margin:12px 0 8px">全局算法参数</h4>
+                    <div class="filter-row" id="global-algo-params">
+                        <label style="font-size:13px;display:inline-flex;align-items:center;gap:4px">
+                            回溯窗口(分钟)
+                            <input type="number" id="cfg-lookback-m" class="input-sm" value="30" style="width:60px">
+                        </label>
+                        <label style="font-size:13px;display:inline-flex;align-items:center;gap:4px">
+                            Z-score阈值
+                            <input type="number" id="cfg-z-threshold" class="input-sm" value="3.0" step="0.1" style="width:60px">
+                        </label>
+                        <label style="font-size:13px;display:inline-flex;align-items:center;gap:4px">
+                            EWMA Span
+                            <input type="number" id="cfg-ewma-span" class="input-sm" value="10" style="width:60px">
+                        </label>
+                    </div>
+                    <!-- 保存按钮 -->
+                    <div style="margin-top:12px">
+                        <button class="btn btn-primary" onclick="saveDetectionConfig()">💾 保存配置</button>
+                        <span id="detection-save-status" style="margin-left:8px;font-size:12px;color:var(--text-muted)"></span>
+                    </div>
+                </div>
+            </details>
+
+            <!-- 告警列表 -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>告警列表</h3>
+                    <button class="btn btn-sm btn-primary" onclick="loadAlertList()">🔄 刷新告警</button>
+                </div>
+                <!-- 来源过滤 -->
+                <div class="filter-row" id="alert-source-filters">
+                    <span class="text-muted" style="font-size:12px">来源：</span>
+                    <button class="btn btn-sm alert-source-btn active" data-source="all" onclick="filterAlerts('all')">全部</button>
+                    <button class="btn btn-sm alert-source-btn" data-source="k8s_event" onclick="filterAlerts('k8s_event')">
+                        <span class="source-dot source-k8s"></span> K8s事件
+                    </button>
+                    <button class="btn btn-sm alert-source-btn" data-source="prometheus" onclick="filterAlerts('prometheus')">
+                        <span class="source-dot source-prom"></span> Prometheus
+                    </button>
+                    <button class="btn btn-sm alert-source-btn" data-source="pod_health" onclick="filterAlerts('pod_health')">
+                        <span class="source-dot source-pod"></span> Pod健康
+                    </button>
+                    <button class="btn btn-sm alert-source-btn" data-source="node_health" onclick="filterAlerts('node_health')">
+                        <span class="source-dot source-node"></span> 节点健康
+                    </button>
+                    <button class="btn btn-sm alert-source-btn" data-source="metric_anomaly" onclick="filterAlerts('metric_anomaly')">
+                        <span class="source-dot source-metric"></span> 指标异常
+                    </button>
+                    <!-- 严重级别过滤 -->
+                    <span class="text-muted" style="font-size:12px;margin-left:12px">级别：</span>
+                    <select id="alert-severity-filter" class="select-sm" onchange="filterAlerts()">
+                        <option value="all">全部</option>
+                        <option value="critical">Critical</option>
+                        <option value="warning">Warning</option>
+                        <option value="info">Info</option>
+                    </select>
+                </div>
+                <!-- 告警统计 -->
+                <div class="stat-grid" id="alert-source-stats" style="margin-bottom:12px"></div>
+                <!-- 告警表格 -->
+                <table class="data-table" id="alert-table">
+                    <thead>
+                        <tr>
+                            <th>来源</th>
+                            <th>级别</th>
+                            <th>标题</th>
+                            <th>影响资源</th>
+                            <th>命名空间</th>
+                            <th>时间</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="alert-table-body"></tbody>
+                </table>
+                <p class="text-muted" id="alert-empty" style="display:none;padding:20px;text-align:center">暂无告警</p>
+            </div>
+
+            <!-- 告警压缩（SOW核心）— 保留 -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>告警压缩 (SOW核心)</h3>
+                    <button class="btn btn-sm btn-primary" onclick="runAlertScan()">🔍 智能压缩</button>
+                </div>
+                <div id="alert-scan-result">
+                    <p class="text-muted">点击"智能压缩"运行 LLM 告警压缩与根因推荐...</p>
+                </div>
+            </div>
+
+            <!-- 实时检测信号 — 保留 -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>实时检测信号</h3>
+                    <div>
+                        <button class="btn btn-sm" onclick="toggleDetectionSSE()">📡 实时监听</button>
+                        <button class="btn btn-sm btn-danger" onclick="clearSignals()">清空</button>
+                    </div>
+                </div>
+                <div id="detection-feed" class="signal-feed"></div>
+            </div>
+        </section>
+
+        <!-- ═══ RCA Section ═══ -->
+        <section id="view-rca" class="view">
+            <div class="card">
+                <h3>启动根因分析</h3>
+                <div class="rca-form">
+                    <textarea id="rca-query" class="textarea" rows="3" placeholder="描述故障现象，例如：Pod频繁重启，服务延迟增高..."></textarea>
+                    <div class="filter-row">
+                        <input id="rca-ns" class="input-sm" placeholder="命名空间 (可选)">
+                        <button class="btn btn-primary" onclick="startRCA()">🚀 开始分析</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 分析进度（增强版） -->
+            <div class="card" id="rca-progress" style="display:none;">
+                <h3>分析进度</h3>
+                <!-- 迭代指示器 -->
+                <div id="rca-iteration" style="display:none;"></div>
+                <!-- 阶段进度条 -->
+                <div class="pipeline-phases" id="rca-phases"></div>
+                <!-- 假设列表 -->
+                <div class="rca-hypotheses" id="rca-hypotheses" style="display:none;">
+                    <h4>假设排名</h4>
+                    <div id="rca-hyp-list"></div>
+                </div>
+                <!-- 证据面板 -->
+                <div class="rca-evidence" id="rca-evidence" style="display:none;">
+                    <h4>证据收集</h4>
+                    <div class="evidence-grid" id="rca-evidence-grid"></div>
+                </div>
+                <!-- 日志面板 (折叠) -->
+                <details class="rca-log-details">
+                    <summary>详细日志</summary>
+                    <pre class="log-viewer" id="rca-log"></pre>
+                </details>
+            </div>
+
+            <!-- 诊断结果（增强版） -->
+            <div class="card" id="rca-result-card" style="display:none;">
+                <h3>诊断结果</h3>
+                <div id="rca-result-content"></div>
+            </div>
+
+            <div class="card">
+                <h3>历史分析</h3>
+                <div id="rca-history"></div>
+            </div>
+        </section>
+
+        <!-- ═══ Daemon Section ═══ -->
+        <section id="view-daemon" class="view">
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">运行状态</div>
+                    <div class="stat-value" id="daemon-status">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">运行时间</div>
+                    <div class="stat-value" id="daemon-uptime">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">扫描周期</div>
+                    <div class="stat-value" id="daemon-cycles">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">活跃管道</div>
+                    <div class="stat-value" id="daemon-pipelines">-</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h3>守护进程控制</h3>
+                    <div>
+                        <button class="btn btn-sm btn-primary" onclick="startDaemon()">▶️ 启动</button>
+                        <button class="btn btn-sm btn-danger" onclick="stopDaemon()">⏹ 停止</button>
+                    </div>
+                </div>
+                <pre class="log-viewer" id="daemon-log">等待启动...</pre>
+            </div>
+        </section>
+
+        <!-- ═══ Traces Section ═══ -->
+        <section id="view-traces" class="view">
+            <!-- Search filters -->
+            <div class="card">
+                <h3>链路追踪查询</h3>
+                <div class="filter-row">
+                    <select id="trace-service" class="select-sm" onchange="loadTraceOperations()">
+                        <option value="">选择服务</option>
+                    </select>
+                    <select id="trace-operation" class="select-sm">
+                        <option value="">所有操作</option>
+                    </select>
+                    <input type="text" id="trace-min-duration" class="input-sm" placeholder="最短耗时 (如 100ms)" style="width:120px">
+                    <input type="text" id="trace-max-duration" class="input-sm" placeholder="最长耗时 (如 5s)" style="width:120px">
+                    <select id="trace-lookback" class="select-sm">
+                        <option value="1h">最近 1 小时</option>
+                        <option value="2h">最近 2 小时</option>
+                        <option value="6h">最近 6 小时</option>
+                        <option value="12h">最近 12 小时</option>
+                        <option value="24h">最近 24 小时</option>
+                    </select>
+                    <input type="number" id="trace-limit" class="input-sm" value="20" style="width:60px" placeholder="条数">
+                    <button class="btn btn-sm btn-primary" onclick="searchTraces()">🔍 搜索</button>
+                </div>
+                <!-- Trace ID direct lookup -->
+                <div class="filter-row" style="margin-top:8px">
+                    <input type="text" id="trace-id-input" class="input-sm" style="flex:1" placeholder="直接输入 Trace ID 查询">
+                    <button class="btn btn-sm" onclick="lookupTraceById()">查找 Trace</button>
+                </div>
+            </div>
+
+            <!-- Trace results -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>Trace 列表</h3>
+                    <span class="text-muted" id="trace-count"></span>
+                </div>
+                <table class="data-table" id="trace-table">
+                    <thead>
+                        <tr>
+                            <th>Trace ID</th>
+                            <th>根服务</th>
+                            <th>根操作</th>
+                            <th>Span数</th>
+                            <th>涉及服务</th>
+                            <th>总耗时</th>
+                            <th>开始时间</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trace-table-body"></tbody>
+                </table>
+                <p class="text-muted" id="trace-empty" style="display:none;padding:20px;text-align:center">选择服务后搜索Trace...</p>
+            </div>
+
+            <!-- Trace detail panel -->
+            <div class="card" id="trace-detail-card" style="display:none;">
+                <div class="card-header">
+                    <h3>Trace 详情</h3>
+                    <button class="btn btn-sm" onclick="document.getElementById('trace-detail-card').style.display='none'">关闭</button>
+                </div>
+                <div id="trace-detail-content"></div>
+            </div>
+        </section>
+
+        <!-- ═══ Events Section ═══ -->
+        <section id="view-events" class="view">
+            <div class="filter-row">
+                <select id="event-ns" class="select-sm">
+                    <option value="">所有命名空间</option>
+                </select>
+                <button class="btn btn-sm btn-primary" onclick="loadEvents()">查询事件</button>
+            </div>
+            <div class="card">
+                <table class="data-table" id="event-table">
+                    <thead>
+                        <tr><th>类型</th><th>原因</th><th>对象</th><th>消息</th><th>次数</th><th>时间</th></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

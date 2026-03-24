@@ -1,0 +1,977 @@
+"""
+AgenticSRE Web Dashboard
+FastAPI-based single-page application with SSE streaming.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import threading
+import uuid
+from collections import deque
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+# ── Setup Paths ──
+APP_DIR = Path(__file__).parent
+ROOT_DIR = APP_DIR.parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from configs.config_loader import get_config
+from tools import build_tool_registry, LLMClient
+from agents import DetectionAgent, AlertAgent
+from orchestrator.pipeline import Pipeline
+from orchestrator.daemon import Daemon
+
+logger = logging.getLogger(__name__)
+
+# ── FastAPI App ──
+app = FastAPI(title="AgenticSRE Dashboard", version="1.0.0")
+app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+
+# ── Shared State ──
+_state = {
+    "config": None,
+    "pipeline": None,
+    "daemon": None,
+    "daemon_thread": None,
+    "detection_signals": deque(maxlen=200),
+    "rca_runs": {},  # run_id → dict
+    "pipeline_logs": deque(maxlen=500),
+    "daemon_logs": deque(maxlen=500),
+    "sse_subscribers": [],
+}
+
+
+def _get_config():
+    if _state["config"] is None:
+        _state["config"] = get_config()
+    return _state["config"]
+
+
+def _get_pipeline():
+    if _state["pipeline"] is None:
+        _state["pipeline"] = Pipeline(_get_config())
+    return _state["pipeline"]
+
+
+# ── Kubectl Helpers ──
+
+def _kubectl_sync(cmd: str, namespace: str = "") -> str:
+    """Execute kubectl command via SSH jump host (synchronous)."""
+    import subprocess
+    cfg = _get_config()
+    ns_flag = f"-n {namespace}" if namespace else ""
+
+    if cfg.kubernetes.use_ssh and cfg.kubernetes.ssh_jump_host:
+        ssh_target = cfg.kubernetes.ssh_target or cfg.kubernetes.target_host
+        ssh_cmd = f"ssh -J {cfg.kubernetes.ssh_jump_host} {ssh_target} 'kubectl {cmd} {ns_flag}'"
+    else:
+        ssh_cmd = f"kubectl {cmd} {ns_flag}"
+
+    try:
+        result = subprocess.run(
+            ssh_cmd, shell=True, capture_output=True, text=True, timeout=30
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "Error: command timed out"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+async def _kubectl(cmd: str, namespace: str = "") -> str:
+    """Execute kubectl command without blocking the event loop."""
+    return await asyncio.to_thread(_kubectl_sync, cmd, namespace)
+
+
+async def _kubectl_json(cmd: str, namespace: str = "") -> Any:
+    """Execute kubectl -o json and parse without blocking."""
+    raw = await _kubectl(f"{cmd} -o json", namespace)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": raw}
+
+
+# ─────────────────────────────────────────
+# Page Routes
+# ─────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+# ─────────────────────────────────────────
+# Cluster Info APIs
+# ─────────────────────────────────────────
+
+@app.get("/api/cluster/overview")
+async def cluster_overview():
+    """Cluster health summary."""
+    nodes_raw, pods_raw = await asyncio.gather(
+        _kubectl_json("get nodes"),
+        _kubectl_json("get pods --all-namespaces"),
+    )
+    
+    nodes = nodes_raw.get("items", [])
+    pods = pods_raw.get("items", [])
+    
+    # Count pod phases
+    phases = {}
+    total_restarts = 0
+    for pod in pods:
+        phase = pod.get("status", {}).get("phase", "Unknown")
+        phases[phase] = phases.get(phase, 0) + 1
+        for cs in pod.get("status", {}).get("containerStatuses", []):
+            total_restarts += cs.get("restartCount", 0)
+    
+    return {
+        "nodes": len(nodes),
+        "pods_total": len(pods),
+        "pod_phases": phases,
+        "total_restarts": total_restarts,
+        "namespaces": len(set(p.get("metadata", {}).get("namespace", "") for p in pods)),
+    }
+
+
+@app.get("/api/cluster/nodes")
+async def cluster_nodes():
+    """Detailed node info."""
+    data = await _kubectl_json("get nodes")
+    nodes = []
+    for n in data.get("items", []):
+        meta = n.get("metadata", {})
+        status = n.get("status", {})
+        conditions = {c["type"]: c["status"] for c in status.get("conditions", [])}
+        nodes.append({
+            "name": meta.get("name", ""),
+            "roles": [l.split("/")[-1] for l in meta.get("labels", {}) if "node-role" in l],
+            "ready": conditions.get("Ready", "Unknown"),
+            "version": status.get("nodeInfo", {}).get("kubeletVersion", ""),
+            "os": status.get("nodeInfo", {}).get("osImage", ""),
+            "cpu": status.get("capacity", {}).get("cpu", ""),
+            "memory": status.get("capacity", {}).get("memory", ""),
+        })
+    return {"nodes": nodes}
+
+
+@app.get("/api/cluster/namespaces")
+async def cluster_namespaces():
+    raw = await _kubectl("get namespaces -o jsonpath='{.items[*].metadata.name}'")
+    return {"namespaces": raw.replace("'", "").split()}
+
+
+@app.get("/api/cluster/pods")
+async def cluster_pods(namespace: str = ""):
+    """List pods with status info."""
+    if namespace:
+        data = await _kubectl_json("get pods", namespace)
+    else:
+        data = await _kubectl_json("get pods --all-namespaces")
+    pods = []
+    for p in data.get("items", []):
+        meta = p.get("metadata", {})
+        status = p.get("status", {})
+        containers = status.get("containerStatuses", [])
+        ready = sum(1 for c in containers if c.get("ready"))
+        restarts = sum(c.get("restartCount", 0) for c in containers)
+        pods.append({
+            "name": meta.get("name", ""),
+            "namespace": meta.get("namespace", ""),
+            "phase": status.get("phase", "Unknown"),
+            "ready": f"{ready}/{len(containers)}",
+            "restarts": restarts,
+            "node": p.get("spec", {}).get("nodeName", ""),
+            "age": meta.get("creationTimestamp", ""),
+        })
+    return {"pods": pods}
+
+
+@app.get("/api/cluster/events")
+async def cluster_events(namespace: str = "", limit: int = 50):
+    """Recent K8s events."""
+    if namespace:
+        data = await _kubectl_json("get events --sort-by=.lastTimestamp", namespace)
+    else:
+        data = await _kubectl_json("get events --sort-by=.lastTimestamp --all-namespaces")
+    events = []
+    for e in data.get("items", [])[-limit:]:
+        events.append({
+            "type": e.get("type", ""),
+            "reason": e.get("reason", ""),
+            "message": e.get("message", ""),
+            "source": e.get("source", {}).get("component", ""),
+            "object": e.get("involvedObject", {}).get("name", ""),
+            "namespace": e.get("involvedObject", {}).get("namespace", ""),
+            "count": e.get("count", 1),
+            "last_seen": e.get("lastTimestamp", ""),
+        })
+    return {"events": events}
+
+
+@app.get("/api/cluster/services")
+async def cluster_services(namespace: str = ""):
+    if namespace:
+        data = await _kubectl_json("get services", namespace)
+    else:
+        data = await _kubectl_json("get services --all-namespaces")
+    services = []
+    for s in data.get("items", []):
+        meta = s.get("metadata", {})
+        spec = s.get("spec", {})
+        ports = [f"{p.get('port')}/{p.get('protocol','TCP')}" for p in spec.get("ports", [])]
+        services.append({
+            "name": meta.get("name", ""),
+            "namespace": meta.get("namespace", ""),
+            "type": spec.get("type", ""),
+            "cluster_ip": spec.get("clusterIP", ""),
+            "ports": ", ".join(ports),
+        })
+    return {"services": services}
+
+
+@app.get("/api/logs/{namespace}/{pod}")
+async def pod_logs(namespace: str, pod: str, lines: int = 200, container: str = ""):
+    c_flag = f"-c {container}" if container else ""
+    raw = await _kubectl(f"logs {pod} {c_flag} --tail={lines}", namespace)
+    return {"logs": raw}
+
+
+# ─────────────────────────────────────────
+# Prometheus Query APIs
+# ─────────────────────────────────────────
+
+def _prom_query_sync(query: str, query_type: str = "instant",
+                     start: str = "", end: str = "", step: str = "60s") -> dict:
+    """Execute Prometheus query synchronously."""
+    cfg = _get_config()
+    base_url = cfg.observability.prometheus_url
+    if not base_url:
+        return {"error": "Prometheus URL not configured"}
+
+    import requests as req
+    try:
+        if query_type == "range":
+            url = f"{base_url}/api/v1/query_range"
+            params = {"query": query, "step": step}
+            params["start"] = start or str(int(time.time()) - 3600)
+            params["end"] = end or str(int(time.time()))
+        else:
+            url = f"{base_url}/api/v1/query"
+            params = {"query": query}
+
+        resp = req.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") == "success":
+            return {"results": data.get("data", {}).get("result", []),
+                    "resultType": data.get("data", {}).get("resultType", "")}
+        return {"error": data.get("error", "Unknown error")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/prometheus/query")
+async def prometheus_query(query: str = "", query_type: str = "instant",
+                           start: str = "", end: str = "", step: str = "60s"):
+    """Execute arbitrary PromQL queries."""
+    if not query:
+        raise HTTPException(400, "Missing 'query' parameter")
+    result = await asyncio.to_thread(_prom_query_sync, query, query_type, start, end, step)
+    return result
+
+
+@app.get("/api/prometheus/metrics_summary")
+async def prometheus_metrics_summary(namespace: str = ""):
+    """Pre-built metrics summary for the dashboard: node CPU/mem/disk + container top."""
+    ns_filter = f'namespace="{namespace}"' if namespace else ''
+
+    queries = {
+        "node_cpu": 'avg by(instance)(1 - rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100',
+        "node_memory": '(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100',
+        "node_disk": '(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100',
+    }
+
+    if ns_filter:
+        queries["container_cpu_top"] = (
+            f'topk(10, sum by(pod)(rate(container_cpu_usage_seconds_total{{{ns_filter}}}[5m])) * 100)'
+        )
+        queries["container_mem_top"] = (
+            f'topk(10, sum by(pod)(container_memory_working_set_bytes{{{ns_filter}}}) / 1024 / 1024)'
+        )
+    else:
+        queries["container_cpu_top"] = (
+            'topk(10, sum by(pod, namespace)(rate(container_cpu_usage_seconds_total[5m])) * 100)'
+        )
+        queries["container_mem_top"] = (
+            'topk(10, sum by(pod, namespace)(container_memory_working_set_bytes) / 1024 / 1024)'
+        )
+
+    import concurrent.futures
+    results = {}
+
+    def _query_one(key, q):
+        return key, _prom_query_sync(q)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(_query_one, k, q) for k, q in queries.items()]
+        for f in concurrent.futures.as_completed(futures):
+            k, v = f.result()
+            results[k] = v
+
+    return results
+
+
+# ─────────────────────────────────────────
+# Jaeger Trace APIs
+# ─────────────────────────────────────────
+
+def _jaeger_request(path: str, params: dict = None) -> dict:
+    """Execute Jaeger API request synchronously."""
+    cfg = _get_config()
+    base_url = cfg.observability.jaeger_url
+    if not base_url:
+        return {"error": "Jaeger URL not configured"}
+
+    import requests as req
+    try:
+        url = f"{base_url.rstrip('/')}{path}"
+        resp = req.get(url, params=params or {}, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/jaeger/services")
+async def jaeger_services():
+    """List available services in Jaeger."""
+    data = await asyncio.to_thread(_jaeger_request, "/api/services")
+    services = data.get("data", []) if not data.get("error") else []
+    return {"services": services, "error": data.get("error")}
+
+
+@app.get("/api/jaeger/traces")
+async def jaeger_traces(service: str = "", operation: str = "",
+                        min_duration: str = "", max_duration: str = "",
+                        limit: int = 20, lookback: str = "1h"):
+    """Search traces by service and filters."""
+    if not service:
+        raise HTTPException(400, "Missing 'service' parameter")
+
+    params = {"service": service, "limit": limit, "lookback": lookback}
+    if operation:
+        params["operation"] = operation
+    if min_duration:
+        params["minDuration"] = min_duration
+    if max_duration:
+        params["maxDuration"] = max_duration
+
+    data = await asyncio.to_thread(_jaeger_request, "/api/traces", params)
+    if data.get("error"):
+        return {"traces": [], "error": data["error"]}
+
+    traces = data.get("data", [])
+    summaries = []
+    for trace in traces[:limit]:
+        spans = trace.get("spans", [])
+        services_in_trace = list(set(
+            s.get("process", {}).get("serviceName", "") for s in spans
+        ))
+        durations = [s.get("duration", 0) for s in spans]
+        root_span = next((s for s in spans if not s.get("references")), spans[0] if spans else {})
+        summaries.append({
+            "traceID": trace.get("traceID", ""),
+            "root_service": root_span.get("process", {}).get("serviceName", ""),
+            "root_operation": root_span.get("operationName", ""),
+            "span_count": len(spans),
+            "services": services_in_trace,
+            "total_duration_us": max(durations) if durations else 0,
+            "avg_duration_us": sum(durations) // max(len(durations), 1),
+            "start_time": root_span.get("startTime", 0),
+        })
+
+    return {"traces": summaries, "total": len(summaries)}
+
+
+@app.get("/api/jaeger/trace/{trace_id}")
+async def jaeger_trace_detail(trace_id: str):
+    """Get full trace detail by trace ID."""
+    data = await asyncio.to_thread(_jaeger_request, f"/api/traces/{trace_id}")
+    if data.get("error"):
+        return {"error": data["error"]}
+
+    traces = data.get("data", [])
+    if not traces:
+        raise HTTPException(404, "Trace not found")
+
+    trace = traces[0]
+    spans = trace.get("spans", [])
+    processes = trace.get("processes", {})
+
+    span_list = []
+    for s in spans:
+        pid = s.get("processID", "")
+        proc = processes.get(pid, {})
+        span_list.append({
+            "spanID": s.get("spanID", ""),
+            "operationName": s.get("operationName", ""),
+            "serviceName": proc.get("serviceName", ""),
+            "duration_us": s.get("duration", 0),
+            "startTime": s.get("startTime", 0),
+            "tags": {t["key"]: t["value"] for t in s.get("tags", [])},
+            "logs": [{"ts": l.get("timestamp"), "fields": l.get("fields")} for l in s.get("logs", [])],
+            "references": s.get("references", []),
+        })
+
+    return {
+        "traceID": trace.get("traceID"),
+        "spans": span_list,
+        "span_count": len(span_list),
+        "processes": processes,
+    }
+
+
+@app.get("/api/jaeger/operations")
+async def jaeger_operations(service: str = ""):
+    """List operations for a Jaeger service."""
+    if not service:
+        return {"operations": []}
+    data = await asyncio.to_thread(_jaeger_request, f"/api/services/{service}/operations")
+    operations = data.get("data", []) if not data.get("error") else []
+    return {"operations": operations, "error": data.get("error")}
+
+
+# ─────────────────────────────────────────
+# Detection & Alert APIs
+# ─────────────────────────────────────────
+
+@app.get("/api/detection/signals")
+async def get_detection_signals():
+    return {"signals": list(_state["detection_signals"])}
+
+
+@app.delete("/api/detection/signals")
+async def clear_detection_signals():
+    _state["detection_signals"].clear()
+    return {"status": "cleared"}
+
+
+@app.get("/api/detection/stream")
+async def detection_stream():
+    """SSE stream for detection signals."""
+    async def event_gen():
+        last_count = 0
+        while True:
+            current = len(_state["detection_signals"])
+            if current > last_count:
+                new = list(_state["detection_signals"])[last_count:]
+                for s in new:
+                    yield f"data: {json.dumps(s)}\n\n"
+                last_count = current
+            else:
+                yield f": heartbeat {int(time.time())}\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.get("/api/detection/config")
+async def get_detection_config():
+    """返回当前检测配置"""
+    cfg = _get_config()
+    det = cfg.detection
+    return {
+        "sources_enabled": det.sources_enabled,
+        "metric_checks": det.metric_checks,
+        "critical_event_reasons": det.critical_event_reasons,
+        "critical_pod_reasons": det.critical_pod_reasons,
+        "default_detect_methods": det.default_detect_methods,
+        "default_lookback_m": det.default_lookback_m,
+        "default_z_threshold": det.default_z_threshold,
+        "default_ewma_span": det.default_ewma_span,
+        "categories_enabled": det.categories_enabled,
+        "business_services": det.business_services,
+        "db_services": det.db_services,
+        "thresholds": det.thresholds,
+    }
+
+
+@app.put("/api/detection/config")
+async def update_detection_config(request: Request):
+    """运行时更新检测配置（内存生效，不写 YAML）"""
+    body = await request.json()
+    cfg = _get_config()
+    det = cfg.detection
+    if "sources_enabled" in body:
+        det.sources_enabled.update(body["sources_enabled"])
+    if "metric_checks" in body:
+        det.metric_checks = body["metric_checks"]
+    if "critical_event_reasons" in body:
+        det.critical_event_reasons = body["critical_event_reasons"]
+    if "critical_pod_reasons" in body:
+        det.critical_pod_reasons = body["critical_pod_reasons"]
+    if "default_detect_methods" in body:
+        det.default_detect_methods = body["default_detect_methods"]
+    if "default_lookback_m" in body:
+        det.default_lookback_m = int(body["default_lookback_m"])
+    if "default_z_threshold" in body:
+        det.default_z_threshold = float(body["default_z_threshold"])
+    if "default_ewma_span" in body:
+        det.default_ewma_span = int(body["default_ewma_span"])
+    if "categories_enabled" in body and isinstance(body["categories_enabled"], dict):
+        det.categories_enabled.update(body["categories_enabled"])
+    if "business_services" in body and isinstance(body["business_services"], list):
+        det.business_services = body["business_services"]
+    if "db_services" in body and isinstance(body["db_services"], list):
+        det.db_services = body["db_services"]
+    if "thresholds" in body and isinstance(body["thresholds"], dict):
+        det.thresholds.update(body["thresholds"])
+    # 重建 pipeline 使配置生效
+    _state["pipeline"] = None
+    return {
+        "status": "ok",
+        "detection": {
+            "sources_enabled": det.sources_enabled,
+            "metric_checks": det.metric_checks,
+            "critical_event_reasons": det.critical_event_reasons,
+            "critical_pod_reasons": det.critical_pod_reasons,
+            "default_detect_methods": det.default_detect_methods,
+            "default_lookback_m": det.default_lookback_m,
+            "default_z_threshold": det.default_z_threshold,
+            "default_ewma_span": det.default_ewma_span,
+            "categories_enabled": det.categories_enabled,
+            "business_services": det.business_services,
+            "db_services": det.db_services,
+            "thresholds": det.thresholds,
+        },
+    }
+
+
+@app.get("/api/alerts/list")
+async def alert_list(namespace: str = ""):
+    """Fetch all current alerts from all sources with details."""
+    cfg = _get_config()
+    registry = build_tool_registry(cfg)
+    llm = LLMClient(cfg.llm) if cfg.llm.api_key else None
+    agent = DetectionAgent(llm, registry, cfg)
+    signals = await asyncio.to_thread(agent.detect, namespace)
+    return {
+        "alerts": [s.to_dict() for s in signals],
+        "total": len(signals),
+        "sources": list(set(s.source for s in signals)),
+    }
+
+
+@app.get("/api/alerts/scan")
+async def alert_scan(namespace: str = ""):
+    """Run alert compression scan (SOW core)."""
+    cfg = _get_config()
+    if not cfg.llm.api_key:
+        raise HTTPException(
+            503,
+            "LLM API Key 未配置。请在 .env 文件中设置 LLM_API_KEY，然后重启服务。"
+        )
+    llm = LLMClient(cfg.llm)
+    registry = build_tool_registry(cfg)
+    agent = AlertAgent(llm, registry)
+
+    # Collect raw alerts first, then compress
+    raw_alerts = await agent._collect_alerts(namespace)
+    result = await agent.compress_and_recommend(alerts=raw_alerts, namespace=namespace)
+
+    # Attach raw alert details for frontend display
+    result["raw_alerts"] = [
+        {"name": a.name, "severity": a.severity, "source": a.source,
+         "timestamp": a.timestamp, "labels": a.labels, "message": a.message}
+        for a in raw_alerts
+    ]
+    return result
+
+
+# ─────────────────────────────────────────
+# RCA APIs
+# ─────────────────────────────────────────
+
+@app.post("/api/rca/run")
+async def rca_run(request: Request):
+    """Trigger an RCA pipeline."""
+    body = await request.json()
+    query = body.get("query", "")
+    namespace = body.get("namespace", "")
+
+    if not query:
+        raise HTTPException(400, "Missing 'query' field")
+
+    cfg = _get_config()
+    if not cfg.llm.api_key:
+        raise HTTPException(
+            503,
+            "LLM API Key 未配置。请在 .env 文件中设置 LLM_API_KEY 或在 config_cluster.yaml 中直接配置 llm.api_key，然后重启服务。"
+        )
+
+    run_id = f"rca-{uuid.uuid4().hex[:8]}"
+    _state["rca_runs"][run_id] = {
+        "id": run_id,
+        "query": query,
+        "namespace": namespace,
+        "status": "running",
+        "logs": [],
+        "events": [],
+        "result": None,
+        "started_at": time.time(),
+    }
+
+    def log_cb(msg):
+        if isinstance(msg, dict):
+            _state["rca_runs"][run_id]["events"].append(msg)
+        else:
+            _state["rca_runs"][run_id]["logs"].append(msg)
+
+    def _run_sync():
+        """Run pipeline in a thread to avoid blocking the event loop."""
+        try:
+            pipeline = _get_pipeline()
+            result = asyncio.run(pipeline.run(query, namespace, log_cb))
+            _state["rca_runs"][run_id]["result"] = result.to_dict()
+            _state["rca_runs"][run_id]["status"] = result.status
+        except Exception as e:
+            logger.error(f"RCA pipeline error: {e}", exc_info=True)
+            _state["rca_runs"][run_id]["status"] = "failed"
+            _state["rca_runs"][run_id]["result"] = {"error": str(e)}
+
+    # Run in background thread (pipeline does sync LLM calls that block the loop)
+    import threading
+    t = threading.Thread(target=_run_sync, daemon=True, name=f"rca-{run_id}")
+    t.start()
+    return {"run_id": run_id}
+
+
+@app.get("/api/rca/history")
+async def rca_history(limit: int = 20):
+    runs = sorted(_state["rca_runs"].values(), key=lambda r: r.get("started_at", 0), reverse=True)
+    return {"runs": [
+        {
+            "id": r["id"],
+            "query": r["query"],
+            "status": r["status"],
+            "started_at": r.get("started_at"),
+            "duration_s": (r.get("result", {}) or {}).get("duration_s", 0),
+        }
+        for r in runs[:limit]
+    ]}
+
+
+@app.get("/api/rca/{run_id}")
+async def rca_status(run_id: str):
+    run = _state["rca_runs"].get(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+    return run
+
+
+@app.get("/api/rca/{run_id}/stream")
+async def rca_stream(run_id: str):
+    """SSE stream for RCA execution logs."""
+    run = _state["rca_runs"].get(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+
+    async def event_gen():
+        log_idx = 0
+        evt_idx = 0
+        while True:
+            # Send new logs
+            logs = run["logs"]
+            if log_idx < len(logs):
+                for msg in logs[log_idx:]:
+                    yield f"data: {json.dumps({'type': 'log', 'msg': msg})}\n\n"
+                log_idx = len(logs)
+
+            # Send new structured events
+            events = run.get("events", [])
+            if evt_idx < len(events):
+                for evt in events[evt_idx:]:
+                    yield f"data: {json.dumps({'type': 'event', 'data': evt})}\n\n"
+                evt_idx = len(events)
+
+            if run["status"] in ("completed", "failed"):
+                yield f"data: {json.dumps({'type': 'done', 'status': run['status'], 'result': run.get('result')})}\n\n"
+                break
+
+            yield f": heartbeat\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+# ─────────────────────────────────────────
+# Remediation APIs
+# ─────────────────────────────────────────
+
+@app.post("/api/rca/{run_id}/remediation/approve")
+async def rca_remediation_approve(run_id: str):
+    """Approve and execute the pending remediation plan."""
+    run = _state["rca_runs"].get(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+
+    result = run.get("result")
+    if not result:
+        raise HTTPException(400, "RCA not completed yet")
+
+    # Find remediation data — could be nested in pipeline result
+    rca_inner = result.get("result", result)
+    rem_data = None
+    if isinstance(rca_inner, dict):
+        # Check evidence.remediation in the inner RCA result
+        evidence = rca_inner.get("evidence", {})
+        if isinstance(evidence, dict):
+            rem_data = evidence.get("remediation")
+    # Also check events for remediation plan
+    if not rem_data:
+        for evt in reversed(run.get("events", [])):
+            if evt.get("event") == "remediation":
+                rem_data = evt.get("data")
+                break
+
+    if not rem_data or rem_data.get("status") != "pending_approval":
+        raise HTTPException(400, "No pending remediation plan found")
+
+    plan = rem_data.get("plan", {})
+    if not plan.get("actions"):
+        raise HTTPException(400, "Remediation plan has no actions")
+
+    # Execute the plan
+    cfg = _get_config()
+    from tools import build_tool_registry, LLMClient
+    from agents import RemediationAgent
+    registry = build_tool_registry(cfg, allow_write=True)
+    llm = LLMClient(cfg.llm)
+    agent = RemediationAgent(llm, registry, cfg)
+
+    # Override to skip approval check this time
+    original_require = agent.require_approval
+    agent.require_approval = False
+    agent.enabled = True
+
+    rca_result = rca_inner if isinstance(rca_inner, dict) else result
+    exec_result = await agent.remediate(rca_result, confidence=1.0, approved=True)
+
+    agent.require_approval = original_require
+
+    # Store the execution result
+    run["remediation_result"] = exec_result
+    run.setdefault("events", []).append({"event": "remediation_executed", "data": exec_result})
+
+    return exec_result
+
+
+@app.post("/api/rca/{run_id}/remediation/rollback")
+async def rca_remediation_rollback(run_id: str):
+    """Roll back the last remediation execution."""
+    run = _state["rca_runs"].get(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+
+    cfg = _get_config()
+    from tools import build_tool_registry, LLMClient
+    from agents import RemediationAgent
+    registry = build_tool_registry(cfg, allow_write=True)
+    llm = LLMClient(cfg.llm)
+    agent = RemediationAgent(llm, registry, cfg)
+
+    rollback_result = agent.rollback()
+    run["remediation_rollback"] = rollback_result
+    run.setdefault("events", []).append({"event": "remediation_rollback", "data": rollback_result})
+
+    return rollback_result
+
+
+@app.get("/api/rca/{run_id}/remediation")
+async def rca_remediation_status(run_id: str):
+    """Get remediation status for a run."""
+    run = _state["rca_runs"].get(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+
+    # Find remediation event
+    rem_data = None
+    for evt in reversed(run.get("events", [])):
+        if evt.get("event") in ("remediation", "remediation_executed", "remediation_rollback"):
+            rem_data = evt.get("data")
+            break
+
+    return {
+        "run_id": run_id,
+        "remediation": rem_data,
+        "execution": run.get("remediation_result"),
+        "rollback": run.get("remediation_rollback"),
+    }
+
+
+# ─────────────────────────────────────────
+# Pipeline APIs
+# ─────────────────────────────────────────
+
+@app.get("/api/pipeline/history")
+async def pipeline_history():
+    pipeline = _get_pipeline()
+    return {"history": pipeline.get_history()}
+
+
+@app.get("/api/pipeline/stats")
+async def pipeline_stats():
+    pipeline = _get_pipeline()
+    return pipeline.get_stats()
+
+
+# ─────────────────────────────────────────
+# Daemon Management APIs
+# ─────────────────────────────────────────
+
+@app.get("/api/daemon/status")
+async def daemon_status():
+    daemon = _state.get("daemon")
+    if daemon and daemon._running:
+        return daemon.status()
+    return {"running": False}
+
+
+@app.post("/api/daemon/start")
+async def daemon_start(request: Request):
+    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    
+    if _state.get("daemon") and _state["daemon"]._running:
+        return {"status": "already_running"}
+
+    cfg = _get_config()
+
+    def _push_signal(signal_obj):
+        """Push detection signal to SSE deque for real-time streaming."""
+        _state["detection_signals"].append(
+            signal_obj.to_dict() if hasattr(signal_obj, "to_dict") else signal_obj
+        )
+
+    daemon = Daemon(
+        cfg,
+        log_callback=lambda msg: _state["daemon_logs"].append(msg),
+        signal_callback=_push_signal,
+    )
+    _state["daemon"] = daemon
+
+    def run():
+        asyncio.run(daemon.start())
+
+    t = threading.Thread(target=run, daemon=True, name="sre-daemon")
+    t.start()
+    _state["daemon_thread"] = t
+    return {"status": "started"}
+
+
+@app.post("/api/daemon/stop")
+async def daemon_stop():
+    daemon = _state.get("daemon")
+    if daemon and daemon._running:
+        asyncio.run_coroutine_threadsafe(daemon.stop(), daemon._loop)
+        return {"status": "stopping"}
+    return {"status": "not_running"}
+
+
+@app.get("/api/daemon/logs")
+async def daemon_logs(limit: int = 100):
+    logs = list(_state["daemon_logs"])[-limit:]
+    return {"logs": logs}
+
+
+@app.get("/api/daemon/logs/stream")
+async def daemon_log_stream():
+    """SSE stream for daemon logs."""
+    async def event_gen():
+        idx = 0
+        while True:
+            logs = list(_state["daemon_logs"])
+            if idx < len(logs):
+                for msg in logs[idx:]:
+                    yield f"data: {json.dumps({'type': 'log', 'msg': msg})}\n\n"
+                idx = len(logs)
+            
+            # Status heartbeat
+            daemon = _state.get("daemon")
+            if daemon and daemon._running:
+                yield f"data: {json.dumps({'type': 'status', 'data': daemon.status()})}\n\n"
+            
+            yield f": heartbeat\n\n"
+            await asyncio.sleep(3)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+# ─────────────────────────────────────────
+# Health & Meta
+# ─────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    cfg = _get_config()
+    llm_ok = bool(cfg.llm.api_key)
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "llm_configured": llm_ok,
+    }
+
+
+@app.get("/api/config")
+async def get_config_info():
+    cfg = _get_config()
+    return {
+        "llm_model": cfg.llm.model,
+        "pipeline": {
+            "max_iterations": cfg.pipeline.max_evidence_iterations,
+            "confidence_threshold": cfg.pipeline.hypothesis_confidence_threshold,
+            "enable_correlation": cfg.pipeline.enable_correlation,
+            "enable_graph_rca": cfg.pipeline.enable_graph_rca,
+            "enable_recovery": cfg.pipeline.enable_recovery,
+        },
+        "daemon": {
+            "poll_interval": cfg.daemon.poll_interval_seconds,
+            "dedup_ttl": cfg.daemon.dedup_ttl_seconds,
+            "max_concurrent": cfg.daemon.max_concurrent_pipelines,
+        },
+    }
+
+
+# ─────────────────────────────────────────
+# Startup
+# ─────────────────────────────────────────
+
+@app.on_event("startup")
+async def on_startup():
+    logger.info("AgenticSRE Dashboard starting...")
+    cfg = _get_config()
+    if not cfg.llm.api_key:
+        logger.warning(
+            "⚠️  LLM API Key 未配置！RCA、告警压缩等 LLM 功能将不可用。"
+            "请在项目根目录 .env 文件中设置 LLM_API_KEY=<your-key>，"
+            "或在 configs/config_cluster.yaml 中配置 llm.api_key，然后重启服务。"
+        )
+    else:
+        logger.info(f"LLM configured: model={cfg.llm.model}, base_url={cfg.llm.base_url}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    uvicorn.run(app, host="0.0.0.0", port=8080)
