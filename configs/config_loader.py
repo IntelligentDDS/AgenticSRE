@@ -45,6 +45,12 @@ class KubernetesConfig:
 
 @dataclass
 class ObservabilityConfig:
+    backend: str = "native"        # "native" (Prometheus/ES/Jaeger) | "alidata"
+    alidata_env_file: str = ""     # .env path with AliData credentials
+    offline_mode: bool = False     # true = read local problem_* data via AliData adapters
+    offline_data_dir: str = ""     # local directory that contains problem_xxx folders
+    offline_problem_id: str = ""   # e.g. "002"
+    offline_data_type: str = "auto"  # auto | baseline | failure
     prometheus_url: str = ""
     elasticsearch_url: str = ""
     jaeger_url: str = ""
@@ -267,16 +273,19 @@ def _load_dotenv():
         Path(__file__).parent.parent / ".env",
         Path.cwd() / ".env",
     ]:
-        if candidate.exists():
-            with open(candidate) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, _, value = line.partition('=')
-                        key = key.strip()
-                        value = value.strip().strip('"').strip("'")
-                        if key and key not in os.environ:
-                            os.environ[key] = value
+        if candidate.exists() and candidate.is_file():
+            try:
+                with open(candidate) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, _, value = line.partition('=')
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            if key and key not in os.environ:
+                                os.environ[key] = value
+            except (OSError, IOError):
+                continue
             break
 
 

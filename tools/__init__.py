@@ -60,18 +60,36 @@ def build_tool_registry(config=None, allow_write: bool = False) -> ToolRegistry:
     registry.register(K8sHealthTool(kubectl), "kubernetes")
 
     # ── Observability Tools ──
-    registry.register(
-        PrometheusTool(cfg.observability.prometheus_url, llm_client=llm),
-        "observability"
-    )
-    registry.register(
-        ElasticsearchTool(cfg.observability.elasticsearch_url),
-        "observability"
-    )
-    registry.register(
-        JaegerTool(cfg.observability.jaeger_url),
-        "observability"
-    )
+    if cfg.observability.backend == "alidata":
+        from tools.alidata_observability import (
+            AliDataMetricTool, AliDataLogTool, AliDataTraceTool,
+            create_ali_downloader,
+        )
+        downloader = create_ali_downloader(
+            cfg.observability.alidata_env_file,
+            offline_mode=getattr(cfg.observability, "offline_mode", False),
+            offline_data_dir=getattr(cfg.observability, "offline_data_dir", ""),
+            offline_problem_id=getattr(cfg.observability, "offline_problem_id", ""),
+            offline_data_type=getattr(cfg.observability, "offline_data_type", "auto"),
+        )
+        registry.register(
+            AliDataMetricTool(downloader, llm_client=llm), "observability"
+        )
+        registry.register(AliDataLogTool(downloader), "observability")
+        registry.register(AliDataTraceTool(downloader), "observability")
+    else:
+        registry.register(
+            PrometheusTool(cfg.observability.prometheus_url, llm_client=llm),
+            "observability"
+        )
+        registry.register(
+            ElasticsearchTool(cfg.observability.elasticsearch_url),
+            "observability"
+        )
+        registry.register(
+            JaegerTool(cfg.observability.jaeger_url),
+            "observability"
+        )
 
     # ── Analysis Tools ──
     registry.register(AnomalyDetectionTool(), "analysis")

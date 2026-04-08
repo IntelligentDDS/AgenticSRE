@@ -75,14 +75,15 @@ Be precise and cite specific metric values. Format as structured analysis."""
                     for series in result.get("results", []):
                         values = self._extract_values(series)
                         if values:
+                            label = series.get("metric", {})
+                            service = (label.get("pod", "") or
+                                     label.get("instance", "") or
+                                     label.get("service", metric_name))
+
                             anomaly = self.hero.three_sigma_detect(values)
                             if anomaly.get("anomaly_count", 0) > 0:
-                                label = series.get("metric", {})
-                                service = (label.get("pod", "") or 
-                                         label.get("instance", "") or 
-                                         label.get("service", metric_name))
                                 all_anomalies[f"{metric_name}:{service}"] = anomaly
-                            
+
                             # WeRCA onset detection
                             onset = self.hero.pearson_onset_detection(values)
                             if onset.get("onset_points"):

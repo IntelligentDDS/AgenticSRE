@@ -6,20 +6,27 @@
 const state = {
     currentView: 'overview',
     refreshTimer: null,
-    refreshInterval: 10,
+    refreshInterval: 0,
     sseConnections: {},
     rcaRunId: null,
     daemonLogSSE: null,
     detectionSSE: null,
     podChart: null,
+    runtime: {
+        offlineMode: false,
+        observabilityBackend: 'native',
+        offlineProblemId: '',
+        offlineDataType: '',
+    },
 };
 
 // ── Init ──
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     initNavigation();
+    initOfflineProblemSwitcher();
     initRefresh();
+    await healthCheck();
     loadOverview();
-    healthCheck();
     setInterval(healthCheck, 30000);
 });
 
@@ -40,7 +47,17 @@ function initNavigation() {
     });
 }
 
+function initOfflineProblemSwitcher() {
+    const select = document.getElementById('offline-problem-select');
+    if (!select) return;
+    select.addEventListener('change', switchOfflineProblem);
+}
+
 function switchView(viewId) {
+    if (isOfflineMode() && viewId === 'events') {
+        viewId = 'overview';
+    }
+
     // Update nav
     document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
     document.querySelector(`.nav-item[data-view="${viewId}"]`)?.classList.add('active');
@@ -50,26 +67,36 @@ function switchView(viewId) {
     document.getElementById(`view-${viewId}`)?.classList.add('active');
 
     // Update title
-    const titles = {
-        overview: '集群概览', metrics: '指标监控', logs: '日志查询',
-        alerts: '告警中心', rca: '根因分析', traces: '链路追踪',
-        daemon: '守护进程', events: '事件追踪'
-    };
-    document.getElementById('view-title').textContent = titles[viewId] || viewId;
+    document.getElementById('view-title').textContent = getViewTitle(viewId);
 
     state.currentView = viewId;
     refreshCurrentView();
+}
+
+function getViewTitle(viewId) {
+    const titles = isOfflineMode() ? {
+        overview: '离线概览', metrics: '离线指标',
+        logs: '离线日志', alerts: '告警中心', rca: '根因分析',
+        traces: '离线链路', daemon: '守护进程',
+        alidata: 'AliData (阿里云)', events: '事件追踪'
+    } : {
+        overview: '集群概览', metrics: '指标监控', logs: '日志查询',
+        alerts: '告警中心', rca: '根因分析', traces: '链路追踪',
+        daemon: '守护进程', alidata: 'AliData (阿里云)', events: '事件追踪'
+    };
+    return titles[viewId] || viewId;
 }
 
 function refreshCurrentView() {
     const loaders = {
         overview: loadOverview,
         metrics: loadMetrics,
-        logs: () => loadNamespaces('log-ns'),
+        logs: loadLogsView,
         alerts: () => { loadAlertList(); loadDetectionConfig(); },
         rca: loadRCAHistory,
         traces: loadTracesView,
         daemon: loadDaemonStatus,
+        alidata: loadAliDataView,
         events: () => { Promise.all([loadNamespaces('event-ns'), loadEvents()]); },
     };
     (loaders[state.currentView] || (() => {}))();
@@ -78,15 +105,21 @@ function refreshCurrentView() {
 // ── Auto-Refresh ──
 
 function initRefresh() {
-    document.getElementById('refresh-interval').addEventListener('change', (e) => {
-        state.refreshInterval = parseInt(e.target.value);
+    const refreshSelect = document.getElementById('refresh-interval');
+    state.refreshInterval = parseInt(refreshSelect?.value || '0', 10);
+
+    refreshSelect.addEventListener('change', (e) => {
+        state.refreshInterval = parseInt(e.target.value, 10);
         clearInterval(state.refreshTimer);
+        state.refreshTimer = null;
         if (state.refreshInterval > 0) {
             state.refreshTimer = setInterval(refreshCurrentView, state.refreshInterval * 1000);
         }
     });
-    // Start default
-    state.refreshTimer = setInterval(refreshCurrentView, 10000);
+
+    if (state.refreshInterval > 0) {
+        state.refreshTimer = setInterval(refreshCurrentView, state.refreshInterval * 1000);
+    }
 }
 
 // ─────────────────────────────────────────
@@ -122,11 +155,351 @@ function badgeClass(phase) {
     return map[phase] || 'gray';
 }
 
+function isOfflineMode() {
+    return !!state.runtime.offlineMode;
+}
+
+function normalizeOfflineProblemId(value) {
+    const raw = String(value || '').trim();
+    return raw.startsWith('problem_') ? raw.slice('problem_'.length) : raw;
+}
+
+function currentOfflineDataType() {
+    const val = state.runtime.offlineDataType || 'failure';
+    return val === 'auto' ? 'failure' : val;
+}
+
+function currentOfflineLabel() {
+    if (!isOfflineMode()) return '';
+    const pid = state.runtime.offlineProblemId || '?';
+    return `problem_${pid}/${currentOfflineDataType()}`;
+}
+
+async function syncOfflineProblemSwitcher(forceReload = false) {
+    const wrapper = document.getElementById('offline-problem-switcher');
+    const select = document.getElementById('offline-problem-select');
+    if (!wrapper || !select) return;
+
+    if (!isOfflineMode()) {
+        wrapper.style.display = 'none';
+        select.dataset.loaded = '';
+        select.innerHTML = '<option value="">离线模式未开启</option>';
+        return;
+    }
+
+    wrapper.style.display = 'inline-flex';
+
+    if (forceReload || select.dataset.loaded !== 'true') {
+        await loadOfflineProblemOptions();
+        return;
+    }
+
+    if (state.runtime.offlineProblemId) {
+        select.value = state.runtime.offlineProblemId;
+    }
+}
+
+async function loadOfflineProblemOptions() {
+    const select = document.getElementById('offline-problem-select');
+    if (!select) return;
+
+    const previousValue = state.runtime.offlineProblemId || select.value || '';
+    const data = await api('/api/offline/problems');
+    const problems = data?.problems || [];
+
+    if (!problems.length) {
+        const currentValue = normalizeOfflineProblemId(data?.current_problem_id || previousValue);
+        const label = currentValue ? `problem_${currentValue}` : '无可用数据';
+        select.innerHTML = `<option value="${currentValue}">${label}</option>`;
+        select.value = currentValue;
+        select.disabled = !currentValue;
+        select.dataset.loaded = 'true';
+        select.title = data?.error || '未发现可用的离线 problem 数据集';
+        return;
+    }
+
+    select.innerHTML = problems.map(problem => {
+        const flags = [
+            problem.has_failure ? 'F' : '',
+            problem.has_baseline ? 'B' : '',
+        ].filter(Boolean).join('/');
+        const suffix = flags ? ` (${flags})` : '';
+        return `<option value="${problem.problem_id}">${problem.label}${suffix}</option>`;
+    }).join('');
+
+    const nextValue = normalizeOfflineProblemId(data?.current_problem_id || previousValue || problems[0]?.problem_id);
+    select.value = nextValue;
+    select.disabled = false;
+    select.dataset.loaded = 'true';
+    select.title = data?.error || '切换当前离线 problem 数据集';
+}
+
+async function switchOfflineProblem(event) {
+    const select = event?.target || document.getElementById('offline-problem-select');
+    if (!select) return;
+
+    const nextProblemId = normalizeOfflineProblemId(select.value);
+    const currentProblemId = normalizeOfflineProblemId(state.runtime.offlineProblemId);
+    if (!nextProblemId || nextProblemId === currentProblemId) {
+        select.value = currentProblemId;
+        return;
+    }
+
+    const previousValue = currentProblemId;
+    select.disabled = true;
+
+    try {
+        const res = await fetch('/api/offline/problem', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ offline_problem_id: nextProblemId }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(payload?.detail || `HTTP ${res.status}`);
+        }
+
+        state.runtime.offlineProblemId = normalizeOfflineProblemId(payload.offline_problem_id || nextProblemId);
+        state.runtime.offlineDataType = payload.offline_data_type || state.runtime.offlineDataType;
+        await syncOfflineProblemSwitcher(true);
+        await healthCheck();
+        refreshCurrentView();
+    } catch (error) {
+        console.error('Failed to switch offline dataset:', error);
+        select.value = previousValue;
+        window.alert(`切换离线数据失败：${error.message}`);
+    } finally {
+        select.disabled = false;
+    }
+}
+
+function _safeNumber(val, fallback = 0) {
+    const num = Number(val);
+    return Number.isFinite(num) ? num : fallback;
+}
+
+function _truncate(text, maxLen = 14) {
+    const str = String(text || '');
+    return str.length > maxLen ? str.substring(0, maxLen - 2) + '..' : str;
+}
+
+function currentMetricValue(metrics, keys) {
+    for (const key of keys) {
+        const value = metrics?.[key]?.current;
+        if (value != null) return _safeNumber(value);
+    }
+    return 0;
+}
+
+const OFFLINE_POD_KPI_PRIORITY = [
+    'pod_cpu_usage_rate',
+    'pod_cpu_usage_rate_vs_request',
+    'pod_cpu_usage_rate_vs_limit',
+    'pod_memory_usage_bytes',
+    'pod_memory_working_set_bytes',
+    'pod_memory_usage_vs_request',
+    'pod_memory_usage_vs_limit',
+];
+
+function orderOfflinePodKpis(kpis) {
+    const pending = new Set(kpis);
+    const ordered = [];
+
+    OFFLINE_POD_KPI_PRIORITY.forEach(kpi => {
+        if (pending.has(kpi)) {
+            ordered.push(kpi);
+            pending.delete(kpi);
+        }
+    });
+
+    return ordered.concat([...pending].sort());
+}
+
+function setPodTableHeadings(headings) {
+    const thead = document.querySelector('#pod-table thead');
+    if (!thead) return;
+    thead.innerHTML = `<tr>${headings.map(heading => `<th>${escapeHtml(heading)}</th>`).join('')}</tr>`;
+}
+
+function setPodTableLayoutMode(offlineSummary) {
+    const card = document.getElementById('pod-summary-card');
+    const table = document.getElementById('pod-table');
+    const title = document.getElementById('metrics-title-6');
+    if (!card || !table || !title) return;
+
+    card.classList.toggle('offline-pod-summary-card', offlineSummary);
+    table.classList.toggle('pod-summary-table', offlineSummary);
+    title.classList.toggle('offline-summary-title', offlineSummary);
+}
+
+function offlineKpiDisplayUnit(metricName) {
+    if (metricName.includes('memory') && metricName.includes('bytes')) return 'MB';
+    if (metricName.includes('latency')) return 'ms';
+    if (metricName.includes('cpu') || metricName.endsWith('_vs_limit') || metricName.endsWith('_vs_request')) return '%';
+    return '';
+}
+
+function formatOfflineKpiHeading(metricName) {
+    const unit = offlineKpiDisplayUnit(metricName);
+    return unit ? `${metricName} (${unit})` : metricName;
+}
+
+function formatOfflineKpiValue(metricName, value) {
+    if (value == null || !Number.isFinite(value)) return '-';
+
+    if (metricName.includes('memory') && metricName.includes('bytes')) {
+        return (value / (1024 * 1024)).toFixed(1);
+    }
+    if (metricName.includes('latency')) {
+        return (value * 1000).toFixed(1);
+    }
+    if (metricName.includes('cpu') || metricName.endsWith('_vs_limit') || metricName.endsWith('_vs_request')) {
+        return value.toFixed(1);
+    }
+    return value.toFixed(2);
+}
+
+function collectOfflinePodKpis(pods) {
+    const kpis = new Set();
+    (pods || []).forEach(pod => {
+        Object.keys(pod.metrics || {}).forEach(metricName => kpis.add(metricName));
+    });
+    return orderOfflinePodKpis(kpis);
+}
+
+function renderOfflinePodSummaryTable(pods) {
+    const tbody = document.querySelector('#pod-table tbody');
+    if (!tbody) return;
+
+    const kpis = collectOfflinePodKpis(pods);
+    setPodTableHeadings(['Pod', '服务', ...kpis.map(formatOfflineKpiHeading)]);
+
+    if (!pods.length) {
+        tbody.innerHTML = `<tr><td colspan="${Math.max(2 + kpis.length, 2)}" class="text-muted" style="text-align:center">暂无离线 Pod 数据</td></tr>`;
+        return;
+    }
+
+    const sortValue = pod => {
+        if (Number.isFinite(pod.cpu) && pod.cpu > 0) return pod.cpu;
+        if (Number.isFinite(pod.memRatio) && pod.memRatio > 0) return pod.memRatio;
+        for (const kpi of kpis) {
+            const value = pod.metrics?.[kpi];
+            if (Number.isFinite(value)) return value;
+        }
+        return 0;
+    };
+
+    tbody.innerHTML = [...pods].sort((a, b) => sortValue(b) - sortValue(a)).map(pod => `
+        <tr>
+            <td><span class="pod-summary-sticky-label" title="${escapeHtml(pod.pod)}">${escapeHtml(pod.pod)}</span></td>
+            <td><span class="pod-summary-sticky-label" title="${escapeHtml(pod.service)}">${escapeHtml(pod.service)}</span></td>
+            ${kpis.map(metricName => {
+                const rawValue = pod.metrics?.[metricName];
+                const formatted = formatOfflineKpiValue(metricName, rawValue);
+                return `<td class="metric-cell">${formatted === '-' ? '<span class="text-muted">-</span>' : escapeHtml(formatted)}</td>`;
+            }).join('')}
+        </tr>
+    `).join('');
+}
+
+function getOfflineK8sPods(k8s) {
+    const pods = [];
+    for (const [service, podMap] of Object.entries(k8s || {})) {
+        for (const [pod, metrics] of Object.entries(podMap || {})) {
+            const metricSnapshot = {};
+            for (const [metricName, metricSeries] of Object.entries(metrics || {})) {
+                if (metricName === 'entity_id' || typeof metricSeries !== 'object' || metricSeries == null) {
+                    continue;
+                }
+                if (metricSeries.current != null) {
+                    metricSnapshot[metricName] = _safeNumber(metricSeries.current, 0);
+                }
+            }
+
+            pods.push({
+                service,
+                pod,
+                cpu: currentMetricValue(metrics, ['pod_cpu_usage_rate', 'pod_cpu_usage_rate_vs_limit', 'pod_cpu_usage_rate_vs_request']),
+                memMB: currentMetricValue(metrics, ['pod_memory_working_set_bytes', 'pod_memory_usage_bytes']) / (1024 * 1024),
+                memRatio: currentMetricValue(metrics, ['pod_memory_usage_vs_limit', 'pod_memory_usage_vs_request']),
+                metrics: metricSnapshot,
+            });
+        }
+    }
+    return pods;
+}
+
+function getOfflineApmServices(apm) {
+    return Object.entries(apm || {}).map(([service, metrics]) => ({
+        service,
+        requestCount: currentMetricValue(metrics, ['request_count']),
+        errorCount: currentMetricValue(metrics, ['error_count']),
+        latencyMs: currentMetricValue(metrics, ['avg_request_latency_seconds']) * 1000,
+    }));
+}
+
+function buildPseudoResults(items, valueKey, metricBuilder) {
+    return {
+        results: (items || []).map(item => ({
+            metric: metricBuilder(item),
+            value: [Date.now() / 1000, String(_safeNumber(item[valueKey]))],
+        })),
+    };
+}
+
+function renderSimpleBarChart(canvasId, items, labelKey, valueKey, color = '#38bdf8') {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const entries = (items || []).slice(0, 6);
+    if (!entries.length) {
+        ctx.fillStyle = '#5b5f73';
+        ctx.font = '13px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('暂无数据', canvas.width / 2, canvas.height / 2);
+        return;
+    }
+
+    const barW = Math.min(42, (canvas.width - 40) / entries.length - 8);
+    const maxH = canvas.height - 50;
+    const maxVal = Math.max(...entries.map(item => _safeNumber(item[valueKey])), 1);
+
+    entries.forEach((item, i) => {
+        const value = _safeNumber(item[valueKey]);
+        const x = 20 + i * (barW + 8);
+        const h = (value / maxVal) * maxH;
+        const y = canvas.height - 30 - h;
+
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, barW, h);
+
+        ctx.fillStyle = '#8b8fa3';
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(_truncate(item[labelKey], 10), x + barW / 2, canvas.height - 15);
+        ctx.fillText(value.toFixed(0), x + barW / 2, y - 5);
+    });
+}
+
 // ─────────────────────────────────────────
 // Overview
 // ─────────────────────────────────────────
 
 async function loadOverview() {
+    if (isOfflineMode()) {
+        return loadOfflineOverview();
+    }
+
+    document.getElementById('overview-stat-label-1').textContent = '节点数';
+    document.getElementById('overview-stat-label-2').textContent = 'Pod总数';
+    document.getElementById('overview-stat-label-3').textContent = '命名空间';
+    document.getElementById('overview-stat-label-4').textContent = '重启次数';
+    document.getElementById('overview-grid-title').textContent = '节点状态';
+    document.getElementById('overview-chart-title').textContent = 'Pod状态分布';
+    document.getElementById('overview-alert-title').textContent = '最近告警';
+
     // Fire all 3 API calls in parallel
     const [data, nodesData, events] = await Promise.all([
         api('/api/cluster/overview'),
@@ -173,6 +546,66 @@ async function loadOverview() {
     }
 }
 
+async function loadOfflineOverview() {
+    const [metricsData, logData, alertsData] = await Promise.all([
+        api('/api/alidata/metrics'),
+        api('/api/alidata/logs?time_range=1h&size=20'),
+        api('/api/alerts/list'),
+    ]);
+
+    const k8s = metricsData?.k8s_metrics || {};
+    const apm = metricsData?.apm_metrics || {};
+    const pods = getOfflineK8sPods(k8s);
+    const services = getOfflineApmServices(apm).sort((a, b) => b.requestCount - a.requestCount);
+    const alerts = alertsData?.alerts || [];
+
+    document.getElementById('overview-stat-label-1').textContent = '服务数';
+    document.getElementById('overview-stat-label-2').textContent = 'Pod数';
+    document.getElementById('overview-stat-label-3').textContent = '数据集';
+    document.getElementById('overview-stat-label-4').textContent = '日志条数';
+    document.getElementById('overview-grid-title').textContent = '服务摘要';
+    document.getElementById('overview-chart-title').textContent = '请求量 Top6';
+    document.getElementById('overview-alert-title').textContent = '离线异常信号';
+
+    document.getElementById('stat-nodes').textContent = services.length;
+    document.getElementById('stat-pods').textContent = pods.length;
+    document.getElementById('stat-ns').textContent = currentOfflineLabel();
+    document.getElementById('stat-restarts').textContent = logData?.total_hits || logData?.returned || 0;
+
+    const nodeGrid = document.getElementById('node-grid');
+    if (services.length) {
+        nodeGrid.innerHTML = services.slice(0, 8).map(s => {
+            const svcPods = pods.filter(p => p.service === s.service).length;
+            return `
+                <div class="node-card">
+                    <div class="node-name">${escapeHtml(s.service)}</div>
+                    <div class="node-meta">
+                        <span class="badge badge-success">Offline</span>
+                        <span class="badge badge-info">Pods ${svcPods}</span>
+                    </div>
+                    <div class="node-meta" style="margin-top:4px">Req: ${s.requestCount.toFixed(0)} | Latency: ${s.latencyMs.toFixed(1)} ms</div>
+                </div>
+            `;
+        }).join('');
+    } else {
+        nodeGrid.innerHTML = '<p class="text-muted">暂无离线服务摘要</p>';
+    }
+
+    renderSimpleBarChart('pod-chart', services, 'service', 'requestCount', '#22c55e');
+
+    const alertPreview = document.getElementById('alert-preview');
+    if (alerts.length) {
+        alertPreview.innerHTML = alerts.slice(0, 8).map(a => `
+            <div class="signal-item">
+                <span><span class="badge badge-${a.severity === 'critical' ? 'danger' : 'warning'}">${escapeHtml(a.source)}</span> ${escapeHtml((a.title || a.description || '').substring(0, 100))}</span>
+                <span class="text-muted">${escapeHtml(a.service || currentOfflineLabel())}</span>
+            </div>
+        `).join('');
+    } else {
+        alertPreview.innerHTML = '<p class="text-muted">离线模式下暂无异常信号</p>';
+    }
+}
+
 function renderPodChart(phases) {
     const canvas = document.getElementById('pod-chart');
     const ctx = canvas.getContext('2d');
@@ -208,6 +641,11 @@ function renderPodChart(phases) {
 // ─────────────────────────────────────────
 
 async function loadMetrics() {
+    applyMetricsModeUI();
+    if (isOfflineMode()) {
+        return loadOfflineMetrics();
+    }
+
     const ns = document.getElementById('metrics-ns')?.value || '';
 
     // Load namespace options (non-blocking)
@@ -244,6 +682,68 @@ async function loadMetrics() {
     }
 }
 
+function applyMetricsModeUI() {
+    const offline = isOfflineMode();
+    document.getElementById('metrics-filter-row').style.display = offline ? 'none' : 'flex';
+    document.getElementById('promql-card').style.display = offline ? 'none' : 'block';
+    setPodTableLayoutMode(offline);
+
+    document.getElementById('metrics-title-1').textContent = offline ? 'Pod CPU 使用率 Top10 (%)' : '节点 CPU 使用率 (%)';
+    document.getElementById('metrics-title-2').textContent = offline ? 'Pod 内存使用 Top10 (MB)' : '节点内存使用率 (%)';
+    document.getElementById('metrics-title-3').textContent = offline ? '服务请求量 Top10' : '节点磁盘使用率 (%)';
+    document.getElementById('metrics-title-4').textContent = offline ? 'Pod CPU Top10 (%)' : '容器 CPU Top10 (cores %)';
+    document.getElementById('metrics-title-5').textContent = offline ? '服务延迟 Top10 (ms)' : '容器内存 Top10 (MB)';
+    document.getElementById('metrics-title-6').textContent = offline ? `离线 Pod 摘要 (${currentOfflineLabel()})` : 'Pod 状态统计';
+
+    if (offline) {
+        setPodTableHeadings(['Pod', '服务', 'KPI 加载中']);
+    } else {
+        setPodTableHeadings(['名称', '命名空间', '状态', 'Ready', '重启', '节点']);
+    }
+}
+
+async function loadOfflineMetrics() {
+    const data = await api('/api/alidata/metrics');
+    const k8s = data?.k8s_metrics || {};
+    const apm = data?.apm_metrics || {};
+    const pods = getOfflineK8sPods(k8s);
+    const services = getOfflineApmServices(apm);
+
+    const topCpuPods = [...pods].sort((a, b) => b.cpu - a.cpu).slice(0, 10);
+    const topMemPods = [...pods].sort((a, b) => b.memMB - a.memMB).slice(0, 10);
+    const topReqSvcs = [...services].sort((a, b) => b.requestCount - a.requestCount).slice(0, 10);
+    const topLatencySvcs = [...services].sort((a, b) => b.latencyMs - a.latencyMs).slice(0, 10);
+
+    renderMetricBars(
+        'metrics-node-cpu',
+        buildPseudoResults(topCpuPods, 'cpu', item => ({ pod: item.pod, service: item.service })),
+        '%'
+    );
+    renderMetricBars(
+        'metrics-node-memory',
+        buildPseudoResults(topMemPods, 'memMB', item => ({ pod: item.pod, service: item.service })),
+        'MB'
+    );
+    renderMetricBars(
+        'metrics-node-disk',
+        buildPseudoResults(topReqSvcs, 'requestCount', item => ({ service: item.service })),
+        'req'
+    );
+
+    renderContainerTop(
+        'metrics-cpu-top',
+        buildPseudoResults(topCpuPods, 'cpu', item => ({ pod: item.pod, namespace: item.service })),
+        '%'
+    );
+    renderContainerTop(
+        'metrics-mem-top',
+        buildPseudoResults(topLatencySvcs, 'latencyMs', item => ({ service: item.service, namespace: currentOfflineLabel() })),
+        'ms'
+    );
+
+    renderOfflinePodSummaryTable(pods);
+}
+
 function renderMetricBars(containerId, data, unit) {
     const el = document.getElementById(containerId);
     if (!el) return;
@@ -254,11 +754,14 @@ function renderMetricBars(containerId, data, unit) {
         return;
     }
 
+    const values = results.map(r => parseFloat(r.value?.[1] || 0));
+    const maxVal = Math.max(...values, 1);
+
     el.innerHTML = results.map(r => {
-        const label = r.metric?.instance || r.metric?.node || Object.values(r.metric || {})[0] || 'unknown';
+        const label = r.metric?.label || r.metric?.pod || r.metric?.service || r.metric?.instance || r.metric?.node || Object.values(r.metric || {})[0] || 'unknown';
         const shortLabel = label.replace(/:.*$/, '');
         const val = parseFloat(r.value?.[1] || 0).toFixed(1);
-        const pct = Math.min(parseFloat(val), 100);
+        const pct = unit === '%' ? Math.min(parseFloat(val), 100) : (parseFloat(val) / maxVal * 100);
         const color = pct > 90 ? 'var(--danger)' : pct > 75 ? 'var(--warning)' : 'var(--accent)';
         return `
             <div style="margin-bottom:6px">
@@ -285,7 +788,7 @@ function renderContainerTop(tableId, data, unit) {
     }
 
     tbody.innerHTML = results.map(r => {
-        const pod = r.metric?.pod || 'unknown';
+        const pod = r.metric?.pod || r.metric?.service || 'unknown';
         const ns = r.metric?.namespace || '-';
         const val = parseFloat(r.value?.[1] || 0).toFixed(2);
         return `<tr><td>${escapeHtml(pod)}</td><td>${escapeHtml(ns)}</td><td>${val} ${unit}</td></tr>`;
@@ -318,6 +821,7 @@ async function runPromQL() {
 // ─────────────────────────────────────────
 
 async function loadNamespaces(selectId) {
+    if (isOfflineMode()) return;
     const data = await api('/api/cluster/namespaces');
     if (!data?.namespaces) return;
 
@@ -328,6 +832,7 @@ async function loadNamespaces(selectId) {
 }
 
 async function loadPodsByNs() {
+    if (isOfflineMode()) return;
     const ns = document.getElementById('log-ns').value;
     if (!ns) return;
 
@@ -339,7 +844,62 @@ async function loadPodsByNs() {
         data.pods.map(p => `<option value="${p.name}">${p.name} (${p.phase})</option>`).join('');
 }
 
+async function loadLogsView() {
+    applyLogsModeUI();
+    if (isOfflineMode()) {
+        return fetchLogs();
+    }
+    return loadNamespaces('log-ns');
+}
+
+function applyLogsModeUI() {
+    const offline = isOfflineMode();
+    document.getElementById('log-ns').style.display = offline ? 'none' : '';
+    document.getElementById('log-pod').style.display = offline ? 'none' : '';
+    document.getElementById('offline-log-query').style.display = offline ? '' : 'none';
+    document.getElementById('offline-log-level').style.display = offline ? '' : 'none';
+    document.getElementById('offline-log-timerange').style.display = offline ? '' : 'none';
+
+    const viewer = document.getElementById('log-content');
+    if (offline && !viewer.textContent.trim()) {
+        viewer.textContent = '输入关键词后点击查询，或直接查看当前离线数据日志...';
+    }
+}
+
 async function fetchLogs() {
+    if (isOfflineMode()) {
+        const query = document.getElementById('offline-log-query').value.trim();
+        const level = document.getElementById('offline-log-level').value || '';
+        const timeRange = document.getElementById('offline-log-timerange').value || '1h';
+        const lines = document.getElementById('log-lines').value || 200;
+        const viewer = document.getElementById('log-content');
+        viewer.textContent = '加载中...';
+
+        let url = `/api/alidata/logs?time_range=${encodeURIComponent(timeRange)}&size=${encodeURIComponent(lines)}`;
+        if (query) url += `&query=${encodeURIComponent(query)}`;
+        if (level) url += `&level=${encodeURIComponent(level)}`;
+
+        const data = await api(url);
+        if (!data || data.error) {
+            viewer.textContent = `错误: ${data?.error || '请求失败'}`;
+            return;
+        }
+
+        const entries = data.entries || [];
+        if (!entries.length) {
+            viewer.textContent = '无日志内容';
+            return;
+        }
+
+        viewer.textContent = entries.map(e => {
+            const ts = e.timestamp ? formatTime(typeof e.timestamp === 'number' && e.timestamp < 2e10 ? e.timestamp * 1000 : e.timestamp) : '-';
+            const levelTag = (e.level || 'info').toUpperCase();
+            const source = e.service || e.pod || currentOfflineLabel();
+            return `[${ts}] [${levelTag}] [${source}] ${e.message || ''}`;
+        }).join('\n');
+        return;
+    }
+
     const ns = document.getElementById('log-ns').value;
     const pod = document.getElementById('log-pod').value;
     const lines = document.getElementById('log-lines').value || 200;
@@ -371,6 +931,15 @@ async function loadAlertList() {
     const data = await api('/api/alerts/list');
     if (!data) return;
     _alertData = data.alerts || [];
+    if (isOfflineMode()) {
+        updateSourceFilterButtons({
+            prometheus: false,
+            k8s_event: false,
+            pod_health: false,
+            node_health: false,
+            metric_anomaly: true,
+        });
+    }
     renderAlertSourceStats(_alertData);
     filterAlerts();  // apply current filters
 }
@@ -1325,6 +1894,22 @@ async function stopDaemon() {
 // ─────────────────────────────────────────
 
 async function loadTracesView() {
+    applyTracesModeUI();
+    if (isOfflineMode()) {
+        const data = await api('/api/alidata/services');
+        const sel = document.getElementById('trace-service');
+        if (data?.services?.length) {
+            const current = sel.value;
+            sel.innerHTML = '<option value="">选择服务</option>' +
+                data.services.filter(s => s).sort().map(s =>
+                    `<option value="${s}" ${s === current ? 'selected' : ''}>${s}</option>`
+                ).join('');
+        } else {
+            sel.innerHTML = `<option value="">离线服务不可用</option>`;
+        }
+        return;
+    }
+
     // Load Jaeger services for the dropdown
     const data = await api('/api/jaeger/services');
     const sel = document.getElementById('trace-service');
@@ -1342,6 +1927,12 @@ async function loadTracesView() {
 }
 
 async function loadTraceOperations() {
+    if (isOfflineMode()) {
+        const sel = document.getElementById('trace-operation');
+        sel.innerHTML = '<option value="">离线模式不区分操作</option>';
+        return;
+    }
+
     const service = document.getElementById('trace-service')?.value;
     const sel = document.getElementById('trace-operation');
     sel.innerHTML = '<option value="">所有操作</option>';
@@ -1353,6 +1944,12 @@ async function loadTraceOperations() {
             `<option value="${op}">${op}</option>`
         ).join('');
     }
+}
+
+function applyTracesModeUI() {
+    const offline = isOfflineMode();
+    const opSel = document.getElementById('trace-operation');
+    opSel.disabled = offline;
 }
 
 async function searchTraces() {
@@ -1368,7 +1965,9 @@ async function searchTraces() {
     const lookback = document.getElementById('trace-lookback')?.value || '1h';
     const limit = document.getElementById('trace-limit')?.value || 20;
 
-    let url = `/api/jaeger/traces?service=${encodeURIComponent(service)}&lookback=${lookback}&limit=${limit}`;
+    let url = isOfflineMode()
+        ? `/api/alidata/traces?service=${encodeURIComponent(service)}&lookback=${lookback}&limit=${limit}`
+        : `/api/jaeger/traces?service=${encodeURIComponent(service)}&lookback=${lookback}&limit=${limit}`;
     if (operation) url += `&operation=${encodeURIComponent(operation)}`;
     if (minDuration) url += `&min_duration=${encodeURIComponent(minDuration)}`;
     if (maxDuration) url += `&max_duration=${encodeURIComponent(maxDuration)}`;
@@ -1392,6 +1991,30 @@ function renderTraceTable(data) {
 
     emptyEl.style.display = 'none';
     countEl.textContent = `共 ${data.traces.length} 条`;
+
+    if (isOfflineMode()) {
+        tbody.innerHTML = data.traces.map(t => {
+            const durationMs = (t.total_duration_us / 1000).toFixed(1);
+            const shortId = t.traceID?.substring(0, 16) || '';
+            const mainOp = (t.operations || [])[0] || '-';
+            const services = (t.services || []).slice(0, 3).join(', ');
+            const moreServices = t.services?.length > 3 ? ` +${t.services.length - 3}` : '';
+            const errorRate = t.error_rate != null ? `${(t.error_rate * 100).toFixed(1)}%` : '-';
+            return `
+                <tr>
+                    <td><code style="font-size:11px">${escapeHtml(shortId)}</code></td>
+                    <td>${escapeHtml((t.services || [])[0] || '-')}</td>
+                    <td>${escapeHtml(mainOp)}</td>
+                    <td>${t.span_count}</td>
+                    <td style="font-size:11px">${escapeHtml(services)}${moreServices}</td>
+                    <td>${durationMs} ms</td>
+                    <td style="font-size:11px">${errorRate}</td>
+                    <td><button class="btn btn-sm" onclick="viewTraceDetail('${t.traceID}')">详情</button></td>
+                </tr>
+            `;
+        }).join('');
+        return;
+    }
 
     tbody.innerHTML = data.traces.map(t => {
         const durationMs = (t.total_duration_us / 1000).toFixed(1);
@@ -1424,6 +2047,10 @@ async function lookupTraceById() {
 }
 
 async function viewTraceDetail(traceId) {
+    if (isOfflineMode()) {
+        return viewOfflineTraceDetail(traceId);
+    }
+
     const card = document.getElementById('trace-detail-card');
     const content = document.getElementById('trace-detail-content');
     card.style.display = 'block';
@@ -1478,11 +2105,513 @@ async function viewTraceDetail(traceId) {
     `;
 }
 
+async function viewOfflineTraceDetail(traceId) {
+    const card = document.getElementById('trace-detail-card');
+    const content = document.getElementById('trace-detail-content');
+    card.style.display = 'block';
+    content.innerHTML = '<p class="text-muted">加载中...</p>';
+
+    const data = await api(`/api/alidata/trace/${traceId}`);
+    if (!data || data.error) {
+        content.innerHTML = `<p class="text-danger">加载失败: ${data?.error || '未知错误'}</p>`;
+        return;
+    }
+
+    const traces = data.traces || [];
+    if (!traces.length) {
+        content.innerHTML = '<p class="text-muted">无 Trace 数据</p>';
+        return;
+    }
+
+    const trace = traces[0];
+    const services = trace.services || [];
+    const operations = trace.operations || [];
+    const endpoints = trace.endpoints || [];
+    const errorSpans = trace.error_spans || [];
+    const statusDist = trace.http_status_distribution || {};
+    const durationMs = (trace.total_duration_us / 1000).toFixed(1);
+    const errorRate = trace.error_rate != null ? `${(trace.error_rate * 100).toFixed(1)}%` : '-';
+
+    let html = `
+        <div style="margin-bottom:12px">
+            <strong>Trace ID:</strong> <code>${escapeHtml(traceId)}</code>
+            &nbsp; <strong>Span数:</strong> ${trace.span_count}
+            &nbsp; <strong>总耗时:</strong> ${durationMs} ms
+            &nbsp; <strong>错误率:</strong> <span class="${trace.error_rate > 0 ? 'text-danger' : ''}">${errorRate}</span>
+        </div>`;
+
+    html += `<div style="margin-bottom:8px">
+        <strong>涉及服务:</strong> ${services.map(s => `<span class="badge badge-info" style="margin:2px">${escapeHtml(s)}</span>`).join(' ')}
+    </div>`;
+
+    if (operations.length) {
+        html += `<div style="margin-bottom:8px">
+            <strong>操作:</strong> ${operations.slice(0, 10).map(o => `<span class="badge badge-gray" style="margin:2px">${escapeHtml(o)}</span>`).join(' ')}
+        </div>`;
+    }
+
+    if (Object.keys(statusDist).length) {
+        html += `<div style="margin-bottom:8px">
+            <strong>HTTP状态分布:</strong> ${Object.entries(statusDist).map(([code, cnt]) => {
+                const cls = code.startsWith('2') ? 'success' : code.startsWith('4') ? 'warning' : code.startsWith('5') ? 'danger' : 'info';
+                return `<span class="badge badge-${cls}" style="margin:2px">${code}: ${cnt}</span>`;
+            }).join(' ')}
+        </div>`;
+    }
+
+    if (errorSpans.length) {
+        html += `<div style="margin-top:12px">
+            <h4 style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">错误 Spans</h4>
+            <table class="data-table">
+                <thead><tr><th>服务</th><th>操作</th><th>状态码</th><th>耗时</th><th>URL</th></tr></thead>
+                <tbody>${errorSpans.map(es => `
+                    <tr>
+                        <td>${escapeHtml(es.service || '')}</td>
+                        <td>${escapeHtml(es.operation || '')}</td>
+                        <td><span class="badge badge-danger">${es.status_code}</span></td>
+                        <td>${es.duration_ms} ms</td>
+                        <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                            title="${escapeHtml(es.url || '')}">${escapeHtml(es.url || '-')}</td>
+                    </tr>
+                `).join('')}</tbody>
+            </table>
+        </div>`;
+    }
+
+    if (endpoints.length) {
+        html += `<details style="margin-top:12px;font-size:12px">
+            <summary style="cursor:pointer;color:var(--text-muted)">查看请求端点 (${endpoints.length})</summary>
+            <div style="margin-top:6px">
+                ${endpoints.map(ep => `<div class="signal-item" style="font-size:11px">${escapeHtml(ep)}</div>`).join('')}
+            </div>
+        </details>`;
+    }
+
+    content.innerHTML = html;
+}
+
+// ─────────────────────────────────────────
+// AliData (Alibaba Cloud Logs & Traces & Metrics)
+// ─────────────────────────────────────────
+
+let _alidataRefreshTimer = null;
+const _alidataCharts = {};  // canvasId -> Chart instance
+
+const CHART_COLORS = [
+    '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#38bdf8',
+    '#a855f7', '#ec4899', '#14b8a6', '#f97316', '#8b5cf6',
+    '#06b6d4', '#84cc16', '#e11d48', '#0ea5e9', '#d946ef',
+];
+
+async function loadAliDataView() {
+    const [statusData, servicesData] = await Promise.all([
+        api('/api/alidata/status'),
+        api('/api/alidata/services'),
+    ]);
+
+    if (statusData) {
+        document.getElementById('alidata-conn-status').innerHTML = statusData.connected
+            ? '<span class="text-success">已连接</span>' : '<span class="text-danger">未连接</span>';
+        document.getElementById('alidata-log-status').innerHTML = statusData.log_ok
+            ? '<span class="text-success">正常</span>' : '<span class="text-danger">异常</span>';
+        document.getElementById('alidata-trace-status').innerHTML = statusData.trace_ok
+            ? '<span class="text-success">正常</span>' : '<span class="text-danger">异常</span>';
+    }
+
+    if (servicesData?.services?.length) {
+        const services = servicesData.services.filter(s => s).sort();
+        const traceSel = document.getElementById('alidata-trace-service');
+        const traceCur = traceSel.value;
+        traceSel.innerHTML = '<option value="">选择服务</option>' +
+            services.map(s => `<option value="${s}" ${s === traceCur ? 'selected' : ''}>${s}</option>`).join('');
+        const metricSel = document.getElementById('alidata-metric-service');
+        if (metricSel) {
+            const metricCur = metricSel.value;
+            metricSel.innerHTML = '<option value="">所有服务</option>' +
+                services.map(s => `<option value="${s}" ${s === metricCur ? 'selected' : ''}>${s}</option>`).join('');
+        }
+    }
+
+    loadAliDataMetrics();
+    setAliDataAutoRefresh();
+}
+
+function setAliDataAutoRefresh() {
+    if (_alidataRefreshTimer) { clearInterval(_alidataRefreshTimer); _alidataRefreshTimer = null; }
+    const interval = parseInt(document.getElementById('alidata-refresh-interval')?.value || '0');
+    if (interval > 0) {
+        _alidataRefreshTimer = setInterval(() => {
+            if (state.currentView === 'alidata') loadAliDataMetrics();
+        }, interval * 1000);
+    }
+}
+
+async function loadAliDataMetrics() {
+    const emptyEl = document.getElementById('alidata-metrics-empty');
+    if (emptyEl) emptyEl.textContent = '加载中...';
+
+    const data = await api('/api/alidata/metrics');
+    if (!data || data.error) {
+        if (emptyEl) { emptyEl.style.display = 'block'; emptyEl.textContent = `错误: ${data?.error || '请求失败'}`; }
+        return;
+    }
+
+    const filterSvc = document.getElementById('alidata-metric-service')?.value || '';
+    const k8s = data.k8s_metrics || {};
+    const apm = data.apm_metrics || {};
+
+    // ── K8s CPU & Memory Charts ──
+    const cpuDatasets = [];
+    const memDatasets = [];
+    let colorIdx = 0;
+
+    for (const [svc, pods] of Object.entries(k8s)) {
+        if (filterSvc && svc !== filterSvc) continue;
+        for (const [pod, metrics] of Object.entries(pods)) {
+            const cpuData = metrics['pod_cpu_usage_rate'];
+            const memData = metrics['pod_memory_working_set_bytes'] || metrics['pod_memory_usage_bytes'];
+            const shortPod = pod.length > 25 ? pod.substring(0, 23) + '..' : pod;
+            const color = CHART_COLORS[colorIdx % CHART_COLORS.length];
+
+            if (cpuData?.values?.length) {
+                cpuDatasets.push({
+                    label: shortPod,
+                    data: cpuData.values.map(v => ({ x: v[0] * 1000, y: parseFloat(v[1]) })),
+                    borderColor: color, backgroundColor: color + '20',
+                    borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: false,
+                });
+            }
+            if (memData?.values?.length) {
+                memDatasets.push({
+                    label: shortPod,
+                    data: memData.values.map(v => ({ x: v[0] * 1000, y: parseFloat(v[1]) / (1024 * 1024) })),
+                    borderColor: color, backgroundColor: color + '20',
+                    borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: false,
+                });
+            }
+            colorIdx++;
+        }
+    }
+
+    renderChart('chart-k8s-cpu', 'Pod CPU 使用率 (%)', cpuDatasets, '%');
+    renderChart('chart-k8s-mem', 'Pod 内存使用 (MB)', memDatasets, 'MB');
+
+    // ── APM Charts ──
+    const reqDatasets = [];
+    const latDatasets = [];
+    colorIdx = 0;
+
+    for (const [svc, metrics] of Object.entries(apm)) {
+        if (filterSvc && svc !== filterSvc) continue;
+        const reqData = metrics['request_count'];
+        const latData = metrics['avg_request_latency_seconds'];
+        const color = CHART_COLORS[colorIdx % CHART_COLORS.length];
+
+        if (reqData?.values?.length) {
+            reqDatasets.push({
+                label: svc,
+                data: reqData.values.map(v => ({ x: v[0] * 1000, y: parseFloat(v[1]) })),
+                borderColor: color, backgroundColor: color + '30',
+                borderWidth: 2, pointRadius: 1, tension: 0.3, fill: true,
+            });
+        }
+        if (latData?.values?.length) {
+            latDatasets.push({
+                label: svc,
+                data: latData.values.map(v => ({ x: v[0] * 1000, y: parseFloat(v[1]) * 1000 })),
+                borderColor: color, backgroundColor: color + '20',
+                borderWidth: 2, pointRadius: 1, tension: 0.3, fill: false,
+            });
+        }
+        colorIdx++;
+    }
+
+    renderChart('chart-apm-requests', '服务请求量 (req/30s)', reqDatasets, '');
+    renderChart('chart-apm-latency', '平均延迟 (ms)', latDatasets, 'ms');
+
+    // ── APM Summary Table ──
+    const apmBody = document.getElementById('alidata-apm-body');
+    const apmEntries = Object.entries(apm).filter(([svc]) => !filterSvc || svc === filterSvc);
+    if (apmEntries.length) {
+        apmBody.innerHTML = apmEntries.sort((a, b) =>
+            (b[1]?.request_count?.current || 0) - (a[1]?.request_count?.current || 0)
+        ).map(([svc, metrics]) => {
+            const reqCount = metrics.request_count?.current || 0;
+            const latency = metrics.avg_request_latency_seconds?.current || 0;
+            const latencyMs = (latency * 1000).toFixed(1);
+            const latencyClass = latency > 1 ? 'text-danger' : latency > 0.5 ? 'text-warning' : '';
+            return `<tr>
+                <td><strong>${escapeHtml(svc)}</strong></td>
+                <td>${reqCount.toFixed(0)}</td>
+                <td class="${latencyClass}">${latency > 0 ? latency.toFixed(4) + ' (' + latencyMs + 'ms)' : '-'}</td>
+            </tr>`;
+        }).join('');
+        if (emptyEl) emptyEl.style.display = 'none';
+    } else if (cpuDatasets.length || memDatasets.length) {
+        apmBody.innerHTML = '<tr><td colspan="3" class="text-muted" style="text-align:center">暂无 APM 数据</td></tr>';
+        if (emptyEl) emptyEl.style.display = 'none';
+    } else {
+        if (emptyEl) { emptyEl.style.display = 'block'; emptyEl.textContent = '暂无指标数据'; }
+    }
+}
+
+function renderChart(canvasId, title, datasets, unit) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    if (_alidataCharts[canvasId]) { _alidataCharts[canvasId].destroy(); delete _alidataCharts[canvasId]; }
+    if (!datasets.length) {
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#5b5f73'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('暂无数据', canvas.width / 2, canvas.height / 2);
+        return;
+    }
+    _alidataCharts[canvasId] = new Chart(canvas, {
+        type: 'line', data: { datasets },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            animation: { duration: 300 },
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                title: { display: true, text: title, color: '#8b8fa3', font: { size: 13, weight: '600' } },
+                legend: { display: datasets.length <= 8, position: 'bottom',
+                    labels: { color: '#8b8fa3', font: { size: 10 }, boxWidth: 12, padding: 8 } },
+                tooltip: { backgroundColor: '#1e2130', titleColor: '#e4e6ef', bodyColor: '#8b8fa3',
+                    borderColor: '#2a2d3e', borderWidth: 1,
+                    callbacks: {
+                        title: function(ctx) { return ctx[0] ? new Date(ctx[0].parsed.x).toLocaleTimeString('zh-CN') : ''; },
+                        label: function(ctx) { return ctx.dataset.label + ': ' + ctx.parsed.y.toFixed(2) + (unit ? ' ' + unit : ''); }
+                    }
+                },
+            },
+            scales: {
+                x: { type: 'linear',
+                    ticks: { color: '#5b5f73', font: { size: 10 },
+                        callback: function(val) { return new Date(val).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); },
+                        maxTicksLimit: 8 },
+                    grid: { color: '#2a2d3e' } },
+                y: { ticks: { color: '#5b5f73', font: { size: 10 },
+                        callback: function(val) { return val.toFixed(1) + (unit ? ' ' + unit : ''); } },
+                    grid: { color: '#2a2d3e' }, beginAtZero: true },
+            },
+        },
+    });
+}
+
+async function loadAliDataLogs() {
+    const query = document.getElementById('alidata-log-query')?.value?.trim() || '';
+    const level = document.getElementById('alidata-log-level')?.value || '';
+    const timeRange = document.getElementById('alidata-log-timerange')?.value || '1h';
+    const ns = document.getElementById('alidata-log-ns')?.value?.trim() || '';
+    const size = document.getElementById('alidata-log-size')?.value || 200;
+
+    const tbody = document.getElementById('alidata-log-body');
+    const emptyEl = document.getElementById('alidata-log-empty');
+    const statsEl = document.getElementById('alidata-log-stats');
+
+    tbody.innerHTML = '';
+    emptyEl.style.display = 'block';
+    emptyEl.textContent = '加载中...';
+
+    let url = `/api/alidata/logs?time_range=${timeRange}&size=${size}`;
+    if (query) url += `&query=${encodeURIComponent(query)}`;
+    if (level) url += `&level=${encodeURIComponent(level)}`;
+    if (ns) url += `&namespace=${encodeURIComponent(ns)}`;
+
+    const data = await api(url);
+
+    if (!data || data.error) {
+        emptyEl.textContent = `错误: ${data?.error || '请求失败'}`;
+        statsEl.innerHTML = '';
+        return;
+    }
+
+    const entries = data.entries || [];
+    if (!entries.length) {
+        emptyEl.textContent = '未找到日志';
+        statsEl.innerHTML = `<span class="badge badge-gray">共 0 条</span>`;
+        return;
+    }
+
+    emptyEl.style.display = 'none';
+
+    // Stats
+    const levelCounts = {};
+    entries.forEach(e => { levelCounts[e.level] = (levelCounts[e.level] || 0) + 1; });
+    statsEl.innerHTML = `<span class="badge badge-info">共 ${entries.length} 条</span> ` +
+        Object.entries(levelCounts).map(([lv, cnt]) => {
+            const cls = lv === 'error' ? 'danger' : lv === 'warn' ? 'warning' : 'info';
+            return `<span class="badge badge-${cls}">${lv}: ${cnt}</span>`;
+        }).join(' ');
+
+    // Render table
+    tbody.innerHTML = entries.map(e => {
+        const lvCls = e.level === 'error' ? 'danger' : e.level === 'warn' ? 'warning' : 'info';
+        const ts = e.timestamp ? formatTime(
+            typeof e.timestamp === 'number' && e.timestamp < 2e10
+                ? e.timestamp * 1000 : e.timestamp
+        ) : '-';
+        return `<tr>
+            <td style="white-space:nowrap;font-size:11px">${ts}</td>
+            <td><span class="badge badge-${lvCls}">${e.level}</span></td>
+            <td>${escapeHtml(e.service || '-')}</td>
+            <td style="font-size:11px">${escapeHtml(e.pod || '-')}</td>
+            <td style="font-size:11px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                title="${escapeHtml(e.message || '')}">${escapeHtml(e.message || '')}</td>
+        </tr>`;
+    }).join('');
+}
+
+async function searchAliDataTraces() {
+    const service = document.getElementById('alidata-trace-service')?.value;
+    if (!service) { alert('请先选择服务'); return; }
+
+    const lookback = document.getElementById('alidata-trace-lookback')?.value || '1h';
+    const limit = document.getElementById('alidata-trace-limit')?.value || 20;
+
+    const tbody = document.getElementById('alidata-trace-body');
+    const emptyEl = document.getElementById('alidata-trace-empty');
+    tbody.innerHTML = '';
+    emptyEl.style.display = 'block';
+    emptyEl.textContent = '搜索中...';
+
+    const data = await api(`/api/alidata/traces?service=${encodeURIComponent(service)}&lookback=${lookback}&limit=${limit}`);
+
+    if (!data?.traces?.length) {
+        emptyEl.textContent = data?.error ? `错误: ${data.error}` : '未找到 Trace';
+        return;
+    }
+
+    emptyEl.style.display = 'none';
+
+    tbody.innerHTML = data.traces.map(t => {
+        const durationMs = (t.total_duration_us / 1000).toFixed(1);
+        const shortId = t.traceID?.substring(0, 16) || '';
+        const services = (t.services || []).slice(0, 3).join(', ');
+        const moreServices = t.services?.length > 3 ? ` +${t.services.length - 3}` : '';
+        const errorRate = t.error_rate != null ? `${(t.error_rate * 100).toFixed(1)}%` : '-';
+        const errorCls = t.error_rate > 0 ? 'text-danger' : '';
+        return `<tr>
+            <td><code style="font-size:11px">${escapeHtml(shortId)}</code></td>
+            <td>${t.span_count}</td>
+            <td style="font-size:11px">${escapeHtml(services)}${moreServices}</td>
+            <td>${durationMs} ms</td>
+            <td class="${errorCls}">${errorRate}</td>
+            <td><button class="btn btn-sm" onclick="viewAliDataTraceDetail('${t.traceID}')">详情</button></td>
+        </tr>`;
+    }).join('');
+}
+
+async function lookupAliDataTraceById() {
+    const traceId = document.getElementById('alidata-trace-id-input')?.value?.trim();
+    if (!traceId) { alert('请输入 Trace ID'); return; }
+    await viewAliDataTraceDetail(traceId);
+}
+
+async function viewAliDataTraceDetail(traceId) {
+    const card = document.getElementById('alidata-trace-detail-card');
+    const content = document.getElementById('alidata-trace-detail-content');
+    card.style.display = 'block';
+    content.innerHTML = '<p class="text-muted">加载中...</p>';
+
+    const data = await api(`/api/alidata/trace/${traceId}`);
+
+    if (!data || data.error) {
+        content.innerHTML = `<p class="text-danger">加载失败: ${data?.error || '未知错误'}</p>`;
+        return;
+    }
+
+    const traces = data.traces || [];
+    if (!traces.length) {
+        content.innerHTML = '<p class="text-muted">无 Trace 数据</p>';
+        return;
+    }
+
+    const trace = traces[0];
+    const services = trace.services || [];
+    const operations = trace.operations || [];
+    const endpoints = trace.endpoints || [];
+    const errorSpans = trace.error_spans || [];
+    const statusDist = trace.http_status_distribution || {};
+    const durationMs = (trace.total_duration_us / 1000).toFixed(1);
+    const errorRate = trace.error_rate != null ? `${(trace.error_rate * 100).toFixed(1)}%` : '-';
+
+    let html = `
+        <div style="margin-bottom:12px">
+            <strong>Trace ID:</strong> <code>${escapeHtml(traceId)}</code>
+            &nbsp; <strong>Span数:</strong> ${trace.span_count}
+            &nbsp; <strong>总耗时:</strong> ${durationMs} ms
+            &nbsp; <strong>错误率:</strong> <span class="${trace.error_rate > 0 ? 'text-danger' : ''}">${errorRate}</span>
+        </div>`;
+
+    // Services
+    html += `<div style="margin-bottom:8px">
+        <strong>涉及服务:</strong> ${services.map(s => `<span class="badge badge-info" style="margin:2px">${escapeHtml(s)}</span>`).join(' ')}
+    </div>`;
+
+    // Operations
+    if (operations.length) {
+        html += `<div style="margin-bottom:8px">
+            <strong>操作:</strong> ${operations.slice(0, 10).map(o => `<span class="badge badge-gray" style="margin:2px">${escapeHtml(o)}</span>`).join(' ')}
+        </div>`;
+    }
+
+    // HTTP Status Distribution
+    if (Object.keys(statusDist).length) {
+        html += `<div style="margin-bottom:8px">
+            <strong>HTTP状态分布:</strong> ${Object.entries(statusDist).map(([code, cnt]) => {
+                const cls = code.startsWith('2') ? 'success' : code.startsWith('4') ? 'warning' : code.startsWith('5') ? 'danger' : 'info';
+                return `<span class="badge badge-${cls}" style="margin:2px">${code}: ${cnt}</span>`;
+            }).join(' ')}
+        </div>`;
+    }
+
+    // Error Spans
+    if (errorSpans.length) {
+        html += `<div style="margin-top:12px">
+            <h4 style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">错误 Spans</h4>
+            <table class="data-table">
+                <thead><tr><th>服务</th><th>操作</th><th>状态码</th><th>耗时</th><th>URL</th></tr></thead>
+                <tbody>${errorSpans.map(es => `
+                    <tr>
+                        <td>${escapeHtml(es.service || '')}</td>
+                        <td>${escapeHtml(es.operation || '')}</td>
+                        <td><span class="badge badge-danger">${es.status_code}</span></td>
+                        <td>${es.duration_ms} ms</td>
+                        <td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                            title="${escapeHtml(es.url || '')}">${escapeHtml(es.url || '-')}</td>
+                    </tr>
+                `).join('')}</tbody>
+            </table>
+        </div>`;
+    }
+
+    // Endpoints
+    if (endpoints.length) {
+        html += `<details style="margin-top:12px;font-size:12px">
+            <summary style="cursor:pointer;color:var(--text-muted)">查看请求端点 (${endpoints.length})</summary>
+            <div style="margin-top:6px">
+                ${endpoints.map(ep => `<div class="signal-item" style="font-size:11px">${escapeHtml(ep)}</div>`).join('')}
+            </div>
+        </details>`;
+    }
+
+    content.innerHTML = html;
+}
+
 // ─────────────────────────────────────────
 // Events
 // ─────────────────────────────────────────
 
 async function loadEvents() {
+    if (isOfflineMode()) {
+        const tbody = document.querySelector('#event-table tbody');
+        if (tbody) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-muted" style="text-align:center">离线模式下无事件数据</td></tr>';
+        }
+        return;
+    }
+
     const ns = document.getElementById('event-ns')?.value || '';
     const data = await api(`/api/cluster/events?namespace=${ns}&limit=100`);
     if (!data?.events) return;
@@ -1506,16 +2635,35 @@ async function loadEvents() {
 
 async function healthCheck() {
     const data = await api('/api/health');
+    const prevOffline = state.runtime.offlineMode;
+    const prevProblemId = state.runtime.offlineProblemId;
+    const prevDataType = state.runtime.offlineDataType;
     const dot = document.querySelector('#health-dot .dot');
     const text = document.querySelector('#health-dot span:last-child');
     const badge = document.getElementById('cluster-badge');
     const llmWarning = document.getElementById('llm-warning');
+    const eventsNav = document.querySelector('.nav-item[data-view="events"]');
+
+    if (data) {
+        state.runtime.offlineMode = !!data.offline_mode;
+        state.runtime.observabilityBackend = data.observability_backend || 'native';
+        state.runtime.offlineProblemId = data.offline_problem_id || '';
+        state.runtime.offlineDataType = data.offline_data_type || '';
+    }
+
+    await syncOfflineProblemSwitcher(prevOffline !== state.runtime.offlineMode);
 
     if (data?.status === 'ok') {
         dot.className = 'dot dot-green';
-        text.textContent = '系统正常';
+        text.textContent = isOfflineMode() ? '离线模式' : '系统正常';
         badge.className = 'badge badge-success';
-        badge.textContent = '已连接';
+        badge.textContent = isOfflineMode() ? `离线: ${currentOfflineLabel()}` : '已连接';
+        document.getElementById('view-title').textContent = getViewTitle(state.currentView);
+        if (eventsNav) eventsNav.style.display = isOfflineMode() ? 'none' : '';
+        if (isOfflineMode() && state.currentView === 'events') {
+            switchView('overview');
+            return;
+        }
 
         // LLM API Key check
         if (llmWarning) {
@@ -1526,5 +2674,13 @@ async function healthCheck() {
         text.textContent = '连接异常';
         badge.className = 'badge badge-danger';
         badge.textContent = '连接异常';
+    }
+
+    if (
+        prevOffline !== state.runtime.offlineMode
+        || prevProblemId !== state.runtime.offlineProblemId
+        || prevDataType !== state.runtime.offlineDataType
+    ) {
+        refreshCurrentView();
     }
 }

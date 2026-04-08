@@ -63,8 +63,20 @@ class DetectionAgent:
         self.registry = registry
         from configs.config_loader import get_config
         cfg = config or get_config()
+        self._cfg = cfg
+        self.offline_mode = bool(
+            getattr(cfg.observability, "offline_mode", False)
+            and getattr(cfg.observability, "backend", "") == "alidata"
+        )
         det = cfg.detection
         self.sources_enabled = det.sources_enabled
+        if self.offline_mode:
+            # Offline datasets only contain metrics/logs/traces, so skip live-cluster sources.
+            self.sources_enabled = dict(self.sources_enabled)
+            self.sources_enabled["prometheus"] = False
+            self.sources_enabled["k8s_event"] = False
+            self.sources_enabled["pod_health"] = False
+            self.sources_enabled["node_health"] = False
         self.metric_checks = det.metric_checks or self._default_metric_checks()
         self.critical_event_reasons = set(det.critical_event_reasons)
         self.critical_pod_reasons = set(det.critical_pod_reasons)
@@ -252,7 +264,28 @@ class DetectionAgent:
             metric_checks=self.metric_checks,
             detection_cfg=self._detection_cfg,
         )
+        if self.offline_mode:
+            metric_data = self._load_offline_failure_metrics()
+            if not metric_data:
+                return []
+            return detector.detect_offline(metric_data, namespace)
         return detector.detect(namespace)
+
+    def _load_offline_failure_metrics(self) -> Dict[str, Any]:
+        """Load the raw offline failure_metrics.json structure for full-scan detection."""
+        try:
+            from tools.alidata_sdk.utils.local_data_loader import get_local_data_loader
+
+            loader = get_local_data_loader(
+                data_dir=getattr(self._cfg.observability, "offline_data_dir", "")
+            )
+            problem_id = getattr(self._cfg.observability, "offline_problem_id", "")
+            if not problem_id:
+                return {}
+            return loader.load_metrics(problem_id, "failure")
+        except Exception as exc:
+            logger.warning("Failed to load offline failure metrics: %s", exc)
+            return {}
 
     def _check_node_health(self) -> List[DetectionSignal]:
         """Check for unhealthy nodes."""

@@ -32,6 +32,12 @@ kubernetes:
   target_host: ""
 
 observability:
+  backend: "native"
+  alidata_env_file: ".env"
+  offline_mode: false
+  offline_data_dir: ""
+  offline_problem_id: ""
+  offline_data_type: "auto"
   prometheus_url: "http://10.10.3.146:30290"
   elasticsearch_url: "http://localhost:9200"
   jaeger_url: "http://10.10.3.146:30686"

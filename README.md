@@ -85,12 +85,58 @@ python main.py --mode pipeline   # 单次Pipeline
 python main.py --mode rca --query "pod CrashLoopBackOff in namespace default"
 ```
 
-## 验证环境
+## AliData 离线模式
 
-3节点K8S集群:
-```bash
-ssh -J openstack@222.200.180.102 ubuntu@10.10.3.110
+当 `observability.backend: "alidata"` 且 `offline_mode: true` 时，系统不会连接线上阿里云接口，而是直接读取本地离线数据目录。
+
+离线数据来源于阿里天池比赛论坛：
+
+- https://tianchi.aliyun.com/competition/entrance/532387/forum
+
+离线模式相关配置位于 `configs/config.yaml`：
+
+```yaml
+observability:
+  backend: "alidata"
+  offline_mode: true
+  offline_data_dir: "/path/to/dataset"
+  offline_problem_id: "002"
+  offline_data_type: "failure"  # auto | baseline | failure
 ```
+
+字段含义：
+
+- `offline_data_dir`：离线数据根目录，目录下按 `problem_xxx` 组织
+- `offline_problem_id`：当前读取的数据集编号，例如 `002`
+- `offline_data_type`：读取的数据类型，`baseline` 表示基线时段，`failure` 表示故障时段，`auto` 表示由系统自动选择
+
+数据目录格式如下：
+
+```text
+AliData/data/
+├── problem_002/
+│   ├── baseline_logs.json
+│   ├── baseline_metrics.json
+│   ├── failure_logs.json
+│   ├── failure_metrics.json
+│   ├── failure_traces.json
+│   ├── metadata.json
+│   └── metrics.png
+├── problem_003/
+│   └── ...
+└── problem_xxx/
+    └── ...
+```
+
+其中：
+
+- `baseline_logs.json` / `baseline_metrics.json`：基线时段的日志与指标数据
+- `failure_logs.json` / `failure_metrics.json` / `failure_traces.json`：故障时段的日志、指标与调用链数据
+- `metadata.json`：问题编号、时间窗口、下载时间等元数据
+- `metrics.png`：该问题对应的指标可视化截图
+
+离线模式下通常将 `offline_data_dir` 指向 `AliData/data`，再通过 `offline_problem_id` 切换到具体的 `problem_xxx` 数据集。
+
 
 ## 项目结构
 

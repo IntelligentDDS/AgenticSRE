@@ -105,6 +105,10 @@ async def run_rca(
         log("🔧 Initializing tools and agents...")
         if registry is None:
             registry = build_tool_registry(cfg, allow_write=cfg.runtime.enable_self_healing)
+        offline_mode = bool(
+            getattr(cfg.observability, "offline_mode", False)
+            and getattr(cfg.observability, "backend", "") == "alidata"
+        )
         
         llm = LLMClient(cfg.llm)
         
@@ -112,7 +116,7 @@ async def run_rca(
         metric_agent = MetricAgent(llm, registry)
         log_agent = LogAgent(llm, registry)
         trace_agent = TraceAgent(llm, registry)
-        event_agent = EventAgent(llm, registry)
+        event_agent = None if offline_mode else EventAgent(llm, registry)
         hypothesis_agent = HypothesisAgent(llm)
         correlation_agent = CorrelationAgent(llm)
         planning_agent = PlanningAgent(llm, registry)
@@ -145,10 +149,10 @@ async def run_rca(
             incident_query, historical_rules=rules, historical_faults=faults
         )
         for h in session.hypotheses:
-            log(f"  [{h.id}] (conf={h.confidence:.2f}) {h.description[:100]}")
+            log(f"  [{h.id}] (conf={h.confidence:.2f}) {h.description}")
         session.complete_phase(2, notes=f"{len(session.hypotheses)} hypotheses generated")
         emit({"event": "phase_complete", "phase": 2, "name": "HYPOTHESIS_GENERATION", "notes": f"{len(session.hypotheses)} hypotheses generated"})
-        emit({"event": "hypotheses", "items": [{"id": h.id, "confidence": h.confidence, "description": h.description[:150]} for h in session.hypotheses]})
+        emit({"event": "hypotheses", "items": [{"id": h.id, "confidence": h.confidence, "description": h.description} for h in session.hypotheses]})
 
         # ── Step 3: Iterative Evidence Loop ──
         max_iter = cfg.pipeline.max_evidence_iterations
@@ -171,28 +175,32 @@ async def run_rca(
             # Run domain agents in parallel
             log("  Running domain agents in parallel...")
             start_time = time.time()
+            agent_tasks = [
+                ("metric_agent", metric_agent.analyze(incident_query, namespace)),
+                ("log_agent", log_agent.analyze(incident_query, namespace)),
+                ("trace_agent", trace_agent.analyze(incident_query, namespace=namespace)),
+            ]
+            if event_agent is not None:
+                agent_tasks.append(("event_agent", event_agent.analyze(incident_query, namespace)))
 
             results = await asyncio.gather(
-                metric_agent.analyze(incident_query, namespace),
-                log_agent.analyze(incident_query, namespace),
-                trace_agent.analyze(incident_query, namespace=namespace),
-                event_agent.analyze(incident_query, namespace),
+                *(task for _, task in agent_tasks),
                 return_exceptions=True,
             )
 
             # Collect results
-            agent_names = ["metric_agent", "log_agent", "trace_agent", "event_agent"]
             new_evidence = {}
-            for name, result in zip(agent_names, results):
+            for (name, _), result in zip(agent_tasks, results):
                 if isinstance(result, Exception):
                     log(f"  ⚠️ {name} failed: {result}")
                     new_evidence[name] = {"summary": f"Error: {result}", "error": True}
                     emit({"event": "evidence", "agent": name, "summary": f"Error: {result}", "success": False})
                 else:
-                    log(f"  ✅ {name}: {result.get('summary', '')[:100]}")
+                    summary = str(result.get("summary", ""))
+                    log(f"  ✅ {name}: {summary}")
                     new_evidence[name] = result
                     session.evidence[name] = result
-                    emit({"event": "evidence", "agent": name, "summary": result.get("summary", "")[:200], "success": True})
+                    emit({"event": "evidence", "agent": name, "summary": summary, "success": True})
 
             elapsed = time.time() - start_time
             log(f"  Evidence collection: {elapsed:.1f}s")
@@ -202,8 +210,8 @@ async def run_rca(
             session.hypotheses = hypothesis_agent.rerank(session.hypotheses, new_evidence)
             top = session.top_hypothesis()
             if top:
-                log(f"  Top hypothesis: [{top.id}] conf={top.confidence:.2f} — {top.description[:80]}")
-            emit({"event": "hypotheses", "items": [{"id": h.id, "confidence": h.confidence, "description": h.description[:150]} for h in session.hypotheses]})
+                log(f"  Top hypothesis: [{top.id}] conf={top.confidence:.2f} — {top.description}")
+            emit({"event": "hypotheses", "items": [{"id": h.id, "confidence": h.confidence, "description": h.description} for h in session.hypotheses]})
 
             session.iterations.append({
                 "iteration": iteration + 1,

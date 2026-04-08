@@ -64,6 +64,47 @@ def _get_pipeline():
     return _state["pipeline"]
 
 
+def _is_offline_mode() -> bool:
+    cfg = _get_config()
+    return bool(
+        getattr(cfg.observability, "backend", "") == "alidata"
+        and getattr(cfg.observability, "offline_mode", False)
+    )
+
+
+def _reset_alidata_state():
+    """Clear cached AliData adapters so the next request rebuilds them."""
+    _alidata_state["downloader"] = None
+    _alidata_state["log_tool"] = None
+    _alidata_state["trace_tool"] = None
+    _alidata_state["metric_tool"] = None
+
+
+def _refresh_runtime_dependencies():
+    """Rebuild runtime objects that depend on mutable observability config."""
+    _state["pipeline"] = None
+    _reset_alidata_state()
+
+    daemon = _state.get("daemon")
+    if daemon:
+        try:
+            daemon.cfg = _get_config()
+            daemon.pipeline = Pipeline(daemon.cfg)
+            daemon.poll_interval = daemon.cfg.daemon.poll_interval_seconds
+            daemon.dedup_ttl = daemon.cfg.daemon.dedup_ttl_seconds
+            daemon.max_concurrent = daemon.cfg.daemon.max_concurrent_pipelines
+            daemon.namespace = daemon.cfg.daemon.default_namespace
+        except Exception as e:
+            logger.warning("Failed to refresh daemon after config change: %s", e)
+
+
+def _normalize_problem_id(problem_id: str) -> str:
+    value = str(problem_id or "").strip()
+    if value.startswith("problem_"):
+        value = value[len("problem_"):]
+    return value
+
+
 # ── Kubectl Helpers ──
 
 def _kubectl_sync(cmd: str, namespace: str = "") -> str:
@@ -109,7 +150,7 @@ async def _kubectl_json(cmd: str, namespace: str = "") -> Any:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 # ─────────────────────────────────────────
@@ -919,6 +960,286 @@ async def daemon_log_stream():
 
 
 # ─────────────────────────────────────────
+# AliData APIs (Alibaba Cloud Logs & Traces)
+# ─────────────────────────────────────────
+
+_alidata_state = {
+    "downloader": None,
+    "log_tool": None,
+    "trace_tool": None,
+    "metric_tool": None,
+}
+
+
+def _get_alidata_tools():
+    """Lazy-init AliData tools."""
+    if _alidata_state["log_tool"] is None:
+        from tools.alidata_observability import (
+            AliDataLogTool, AliDataTraceTool, AliDataMetricTool,
+            create_ali_downloader,
+        )
+        cfg = _get_config()
+        env_file = getattr(cfg.observability, "alidata_env_file", ".env")
+        downloader = create_ali_downloader(
+            env_file,
+            offline_mode=getattr(cfg.observability, "offline_mode", False),
+            offline_data_dir=getattr(cfg.observability, "offline_data_dir", ""),
+            offline_problem_id=getattr(cfg.observability, "offline_problem_id", ""),
+            offline_data_type=getattr(cfg.observability, "offline_data_type", "auto"),
+        )
+        _alidata_state["downloader"] = downloader
+        _alidata_state["log_tool"] = AliDataLogTool(downloader)
+        _alidata_state["trace_tool"] = AliDataTraceTool(downloader)
+        _alidata_state["metric_tool"] = AliDataMetricTool(downloader)
+    return _alidata_state["log_tool"], _alidata_state["trace_tool"]
+
+
+@app.get("/api/alidata/status")
+async def alidata_status():
+    """Check AliData connectivity."""
+    try:
+        log_tool, trace_tool = _get_alidata_tools()
+        log_ok = await asyncio.to_thread(log_tool.health_check)
+        trace_ok = await asyncio.to_thread(trace_tool.health_check)
+        return {"connected": log_ok or trace_ok, "log_ok": log_ok, "trace_ok": trace_ok}
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
+
+
+@app.get("/api/offline/problems")
+async def offline_problems():
+    """List available offline problem datasets for the UI selector."""
+    cfg = _get_config()
+    current_problem_id = getattr(cfg.observability, "offline_problem_id", "")
+    current_data_type = getattr(cfg.observability, "offline_data_type", "auto")
+
+    if not _is_offline_mode():
+        return {
+            "enabled": False,
+            "current_problem_id": current_problem_id,
+            "offline_data_type": current_data_type,
+            "problems": [],
+        }
+
+    data_dir = getattr(cfg.observability, "offline_data_dir", "")
+    if not data_dir:
+        return {
+            "enabled": True,
+            "current_problem_id": current_problem_id,
+            "offline_data_type": current_data_type,
+            "problems": [],
+            "error": "offline_data_dir is not configured",
+        }
+
+    try:
+        from tools.alidata_sdk.utils.local_data_loader import get_local_data_loader
+
+        loader = get_local_data_loader(data_dir=data_dir)
+        problem_ids = loader.get_available_problems()
+        problems = []
+
+        for problem_id in problem_ids:
+            summary = loader.get_data_summary(problem_id)
+            availability = summary.get("data_availability", {})
+            metadata = summary.get("metadata") or {}
+            problems.append({
+                "problem_id": problem_id,
+                "label": f"problem_{problem_id}",
+                "selected": problem_id == current_problem_id,
+                "has_failure": all(
+                    availability.get(name, False)
+                    for name in ("failure_logs", "failure_metrics", "failure_traces")
+                ),
+                "has_baseline": all(
+                    availability.get(name, False)
+                    for name in ("baseline_logs", "baseline_metrics")
+                ),
+                "time_range": metadata.get("time_range", ""),
+            })
+
+        return {
+            "enabled": True,
+            "current_problem_id": current_problem_id,
+            "offline_data_type": current_data_type,
+            "problems": problems,
+        }
+    except Exception as e:
+        logger.warning("Failed to list offline problems: %s", e)
+        return {
+            "enabled": True,
+            "current_problem_id": current_problem_id,
+            "offline_data_type": current_data_type,
+            "problems": [],
+            "error": str(e),
+        }
+
+
+@app.put("/api/offline/problem")
+async def update_offline_problem(request: Request):
+    """Switch the active offline problem id at runtime."""
+    cfg = _get_config()
+    if not _is_offline_mode():
+        raise HTTPException(400, "Offline mode is not enabled")
+
+    body = await request.json()
+    new_problem_id = _normalize_problem_id(body.get("offline_problem_id", ""))
+    if not new_problem_id:
+        raise HTTPException(400, "Missing 'offline_problem_id'")
+
+    data_dir = getattr(cfg.observability, "offline_data_dir", "")
+    if not data_dir:
+        raise HTTPException(400, "offline_data_dir is not configured")
+
+    try:
+        from tools.alidata_sdk.utils.local_data_loader import get_local_data_loader
+
+        loader = get_local_data_loader(data_dir=data_dir)
+        available_problems = set(loader.get_available_problems())
+    except Exception as e:
+        raise HTTPException(500, f"Failed to read offline datasets: {e}") from e
+
+    if new_problem_id not in available_problems:
+        raise HTTPException(404, f"Offline dataset problem_{new_problem_id} not found")
+
+    new_data_type = str(body.get("offline_data_type") or "").strip().lower()
+    if new_data_type and new_data_type not in {"auto", "baseline", "failure"}:
+        raise HTTPException(400, "offline_data_type must be one of: auto, baseline, failure")
+
+    cfg.observability.offline_problem_id = new_problem_id
+    if new_data_type:
+        cfg.observability.offline_data_type = new_data_type
+
+    _refresh_runtime_dependencies()
+    logger.info(
+        "Switched offline dataset to problem_%s/%s",
+        cfg.observability.offline_problem_id,
+        getattr(cfg.observability, "offline_data_type", "auto"),
+    )
+
+    return {
+        "status": "ok",
+        "offline_problem_id": cfg.observability.offline_problem_id,
+        "offline_data_type": getattr(cfg.observability, "offline_data_type", "auto"),
+    }
+
+
+@app.get("/api/alidata/logs")
+async def alidata_logs(query: str = "", time_range: str = "1h",
+                       level: str = "", size: int = 200, namespace: str = ""):
+    """Fetch logs from Alibaba Cloud SLS/ARMS."""
+    try:
+        log_tool, _ = _get_alidata_tools()
+        result = await asyncio.to_thread(
+            log_tool._execute, query=query, time_range=time_range,
+            level=level, size=size, namespace=namespace
+        )
+        if result.success:
+            return result.data
+        return {"error": result.error, "total_hits": 0, "entries": []}
+    except Exception as e:
+        return {"error": str(e), "total_hits": 0, "entries": []}
+
+
+@app.get("/api/alidata/services")
+async def alidata_services():
+    """List available services from AliData trace data."""
+    try:
+        _, trace_tool = _get_alidata_tools()
+        result = await asyncio.to_thread(trace_tool._execute)
+        if result.success:
+            services = result.data.get("data", [])
+            return {"services": services}
+        return {"services": [], "error": result.error}
+    except Exception as e:
+        return {"services": [], "error": str(e)}
+
+
+@app.get("/api/alidata/traces")
+async def alidata_traces(service: str = "", operation: str = "",
+                         min_duration: str = "", max_duration: str = "",
+                         limit: int = 20, lookback: str = "1h"):
+    """Search traces from Alibaba Cloud ARMS."""
+    if not service:
+        raise HTTPException(400, "Missing 'service' parameter")
+    try:
+        _, trace_tool = _get_alidata_tools()
+        result = await asyncio.to_thread(
+            trace_tool._execute, service=service, operation=operation,
+            min_duration=min_duration, max_duration=max_duration,
+            limit=limit, lookback=lookback
+        )
+        if result.success:
+            return result.data
+        return {"traces": [], "error": result.error}
+    except Exception as e:
+        return {"traces": [], "error": str(e)}
+
+
+@app.get("/api/alidata/trace/{trace_id}")
+async def alidata_trace_detail(trace_id: str):
+    """Get full trace detail by trace ID from AliData."""
+    try:
+        _, trace_tool = _get_alidata_tools()
+        result = await asyncio.to_thread(
+            trace_tool._execute, trace_id=trace_id
+        )
+        if result.success:
+            return result.data
+        return {"error": result.error}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/alidata/metrics")
+async def alidata_metrics(query: str = "", namespace: str = "",
+                          start: str = "", end: str = ""):
+    """Fetch metrics from Alibaba Cloud ARMS.
+    Returns k8s pod metrics (CPU/mem) and APM service metrics (request count, latency).
+    """
+    try:
+        _get_alidata_tools()  # ensure init
+        metric_tool = _alidata_state["metric_tool"]
+        result = await asyncio.to_thread(
+            metric_tool._execute, query=query, namespace=namespace,
+            start=start, end=end, max_results=0
+        )
+        if result.success:
+            data = result.data
+            # Group by service for frontend display
+            k8s_by_service = {}
+            apm_by_service = {}
+            for r in data.get("results", []):
+                metric = r.get("metric", {})
+                name = metric.get("__name__", "")
+                svc = metric.get("service", "")
+                pod = metric.get("pod", "")
+                val = r.get("value", [0, "0"])
+                values = r.get("values", [])
+
+                if pod:
+                    # k8s pod metric
+                    k8s_by_service.setdefault(svc, {}).setdefault(pod, {})[name] = {
+                        "current": float(val[1]) if len(val) > 1 else 0,
+                        "values": values[-60:],
+                    }
+                else:
+                    # APM service metric
+                    apm_by_service.setdefault(svc, {})[name] = {
+                        "current": float(val[1]) if len(val) > 1 else 0,
+                        "values": values[-60:],
+                    }
+
+            return {
+                "k8s_metrics": k8s_by_service,
+                "apm_metrics": apm_by_service,
+                "total_results": data.get("result_count", 0),
+            }
+        return {"error": result.error, "k8s_metrics": {}, "apm_metrics": {}}
+    except Exception as e:
+        return {"error": str(e), "k8s_metrics": {}, "apm_metrics": {}}
+
+
+# ─────────────────────────────────────────
 # Health & Meta
 # ─────────────────────────────────────────
 
@@ -930,6 +1251,10 @@ async def health():
         "status": "ok",
         "timestamp": time.time(),
         "llm_configured": llm_ok,
+        "observability_backend": getattr(cfg.observability, "backend", "native"),
+        "offline_mode": _is_offline_mode(),
+        "offline_problem_id": getattr(cfg.observability, "offline_problem_id", ""),
+        "offline_data_type": getattr(cfg.observability, "offline_data_type", ""),
     }
 
 
@@ -937,6 +1262,12 @@ async def health():
 async def get_config_info():
     cfg = _get_config()
     return {
+        "observability": {
+            "backend": getattr(cfg.observability, "backend", "native"),
+            "offline_mode": _is_offline_mode(),
+            "offline_problem_id": getattr(cfg.observability, "offline_problem_id", ""),
+            "offline_data_type": getattr(cfg.observability, "offline_data_type", ""),
+        },
         "llm_model": cfg.llm.model,
         "pipeline": {
             "max_iterations": cfg.pipeline.max_evidence_iterations,
