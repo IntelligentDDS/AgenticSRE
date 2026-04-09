@@ -1,4 +1,5 @@
 """
+update web
 AgenticSRE Web Dashboard
 FastAPI-based single-page application with SSE streaming.
 """
