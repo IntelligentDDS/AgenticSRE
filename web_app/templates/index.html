@@ -22,8 +22,9 @@
             <li class="nav-item" data-view="rca">🔍 根因分析</li>
             <li class="nav-item" data-view="traces">🔗 链路追踪</li>
             <li class="nav-item" data-view="daemon">🤖 守护进程</li>
-            <li class="nav-item" data-view="alidata">☁️ AliData</li>
             <li class="nav-item" data-view="events">📅 事件追踪</li>
+            <li class="nav-item" data-view="chat">💬 模型交互</li>
+            <li class="nav-item" data-view="alidata">☁️ AliData</li>
         </ul>
         <div class="sidebar-footer">
             <div class="health-indicator" id="health-dot">
@@ -489,6 +490,100 @@
             </div>
         </section>
 
+        <!-- ═══ Events Section ═══ -->
+        <section id="view-events" class="view">
+            <div class="filter-row">
+                <select id="event-ns" class="select-sm">
+                    <option value="">所有命名空间</option>
+                </select>
+                <button class="btn btn-sm btn-primary" onclick="loadEvents()">查询事件</button>
+            </div>
+            <div class="card">
+                <table class="data-table" id="event-table">
+                    <thead>
+                        <tr><th>类型</th><th>原因</th><th>对象</th><th>消息</th><th>次数</th><th>时间</th></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- ═══ Model Chat Section ═══ -->
+        <section id="view-chat" class="view">
+            <!-- Model Info Card -->
+            <div class="card chat-info-card">
+                <div class="chat-model-info">
+                    <div class="model-avatar">🤖</div>
+                    <div class="model-details">
+                        <h3>OpsLLM-7B 智能运维助手</h3>
+                        <p class="text-muted" id="chat-model-status">模型加载中...</p>
+                    </div>
+                    <div class="model-actions">
+                        <button class="btn btn-sm" onclick="clearChatHistory()">🗑️ 清空对话</button>
+                        <button class="btn btn-sm" onclick="exportChatHistory()">📥 导出记录</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chat Container -->
+            <div class="chat-container">
+                <!-- Chat Messages -->
+                <div class="chat-messages" id="chat-messages">
+                    <div class="chat-welcome">
+                        <div class="welcome-icon">🤖</div>
+                        <h3>欢迎使用 OpsLLM-7B 智能运维助手</h3>
+                        <p>我是基于 OpsLLM-7B 模型的 SRE 智能助手，可以帮助您：</p>
+                        <div class="quick-actions">
+                            <button class="quick-action-btn" onclick="sendQuickMessage('如何排查 Pod 一直处于 Pending 状态的问题？')">
+                                🔧 Pod 故障排查
+                            </button>
+                            <button class="quick-action-btn" onclick="sendQuickMessage('如何分析 Kubernetes 集群的性能瓶颈？')">
+                                📊 性能分析
+                            </button>
+                            <button class="quick-action-btn" onclick="sendQuickMessage('告警风暴如何处理和优化？')">
+                                🔔 告警优化
+                            </button>
+                            <button class="quick-action-btn" onclick="sendQuickMessage('如何设计高可用的 Kubernetes 集群？')">
+                                🏗️ 架构设计
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Chat Input -->
+                <div class="chat-input-container">
+                    <div class="chat-input-wrapper">
+                        <textarea
+                            id="chat-input"
+                            class="chat-input"
+                            placeholder="输入您的问题，例如：如何排查 Pod 崩溃的原因？&#10;支持多行输入，Shift+Enter 换行"
+                            rows="2"
+                            onkeydown="handleChatKeydown(event)"
+                            oninput="autoResizeTextarea(this)"
+                        ></textarea>
+                        <button class="chat-send-btn" id="chat-send-btn" onclick="sendChatMessage()">
+                            <span class="send-icon">➤</span>
+                        </button>
+                    </div>
+                    <div class="chat-input-hint">
+                        <span>按 Enter 发送，Shift+Enter 换行</span>
+                        <span id="chat-char-count">0 / 2000</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chat History Panel -->
+            <div class="card chat-history-card">
+                <div class="card-header">
+                    <h3>对话历史</h3>
+                    <button class="btn btn-sm" onclick="loadChatSessions()">🔄 刷新</button>
+                </div>
+                <div class="chat-sessions" id="chat-sessions">
+                    <p class="text-muted">暂无历史对话</p>
+                </div>
+            </div>
+        </section>
+
         <!-- ═══ AliData Section ═══ -->
         <section id="view-alidata" class="view">
             <!-- Status -->
@@ -652,24 +747,6 @@
                     <button class="btn btn-sm" onclick="document.getElementById('alidata-trace-detail-card').style.display='none'">关闭</button>
                 </div>
                 <div id="alidata-trace-detail-content"></div>
-            </div>
-        </section>
-
-        <!-- ═══ Events Section ═══ -->
-        <section id="view-events" class="view">
-            <div class="filter-row">
-                <select id="event-ns" class="select-sm">
-                    <option value="">所有命名空间</option>
-                </select>
-                <button class="btn btn-sm btn-primary" onclick="loadEvents()">查询事件</button>
-            </div>
-            <div class="card">
-                <table class="data-table" id="event-table">
-                    <thead>
-                        <tr><th>类型</th><th>原因</th><th>对象</th><th>消息</th><th>次数</th><th>时间</th></tr>
-                    </thead>
-                    <tbody></tbody>
-                </table>
             </div>
         </section>
     </main>

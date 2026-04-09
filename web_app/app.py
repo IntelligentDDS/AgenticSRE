@@ -1241,6 +1241,126 @@ async def alidata_metrics(query: str = "", namespace: str = "",
 
 
 # ─────────────────────────────────────────
+# Model Interaction APIs (OpsLLM-7B)
+# ─────────────────────────────────────────
+
+_state["chat_sessions"] = {}  # session_id → {"messages": [], "created_at": time}
+
+
+@app.get("/api/model/info")
+async def get_model_info():
+    """Get current LLM model configuration."""
+    cfg = _get_config()
+    return {
+        "model": cfg.llm.model,
+        "base_url": cfg.llm.base_url,
+        "configured": bool(cfg.llm.api_key),
+        "max_tokens": cfg.llm.max_tokens,
+        "temperature": cfg.llm.temperature,
+    }
+
+
+@app.post("/api/model/chat")
+async def model_chat(request: Request):
+    """Send a message to the LLM model and get a response."""
+    body = await request.json()
+    message = body.get("message", "")
+    session_id = body.get("session_id", "default")
+    stream = body.get("stream", False)
+
+    if not message:
+        raise HTTPException(400, "Missing 'message' field")
+
+    cfg = _get_config()
+    if not cfg.llm.api_key:
+        raise HTTPException(
+            503,
+            "LLM API Key 未配置。请在 .env 文件中设置 LLM_API_KEY。"
+        )
+
+    # Initialize or update session
+    if session_id not in _state["chat_sessions"]:
+        _state["chat_sessions"][session_id] = {
+            "messages": [],
+            "created_at": time.time(),
+        }
+
+    session = _state["chat_sessions"][session_id]
+    session["messages"].append({"role": "user", "content": message})
+
+    system_prompt = {
+        "role": "system",
+        "content": "你是 AgenticSRE 的智能运维助手，基于 OpsLLM-7B 模型。你专注于 Kubernetes 容器运维、故障诊断、性能分析、告警处理等 SRE 领域知识。请用中文回答问题，提供专业、准确的技术建议。"
+    }
+    llm_messages = [system_prompt] + session["messages"][-20:]
+
+    try:
+        llm = LLMClient(cfg.llm)
+
+        if stream:
+            async def generate():
+                try:
+                    response_text = await asyncio.to_thread(llm.chat, llm_messages)
+                    session["messages"].append({"role": "assistant", "content": response_text})
+                    chunk_size = 50
+                    for i in range(0, len(response_text), chunk_size):
+                        chunk = response_text[i:i+chunk_size]
+                        yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+                        await asyncio.sleep(0.01)
+                    yield f"data: {json.dumps({'type': 'done', 'session_id': session_id})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+            return StreamingResponse(generate(), media_type="text/event-stream")
+        else:
+            response_text = await asyncio.to_thread(llm.chat, llm_messages)
+            session["messages"].append({"role": "assistant", "content": response_text})
+            return {
+                "response": response_text,
+                "session_id": session_id,
+                "message_count": len(session["messages"]),
+            }
+    except Exception as e:
+        logger.error(f"Model chat error: {e}", exc_info=True)
+        raise HTTPException(500, f"模型调用失败: {str(e)}")
+
+
+@app.get("/api/model/chat/history/{session_id}")
+async def get_chat_history(session_id: str):
+    """Get chat history for a session."""
+    session = _state["chat_sessions"].get(session_id)
+    if not session:
+        return {"messages": [], "session_id": session_id}
+    return {
+        "messages": session["messages"],
+        "session_id": session_id,
+        "created_at": session["created_at"],
+    }
+
+
+@app.delete("/api/model/chat/history/{session_id}")
+async def clear_chat_history(session_id: str):
+    """Clear chat history for a session."""
+    if session_id in _state["chat_sessions"]:
+        _state["chat_sessions"][session_id]["messages"] = []
+        return {"status": "cleared", "session_id": session_id}
+    return {"status": "not_found", "session_id": session_id}
+
+
+@app.get("/api/model/chat/sessions")
+async def list_chat_sessions():
+    """List all chat sessions."""
+    sessions = []
+    for sid, session in _state["chat_sessions"].items():
+        sessions.append({
+            "session_id": sid,
+            "message_count": len(session["messages"]),
+            "created_at": session["created_at"],
+        })
+    return {"sessions": sessions}
+
+
+# ─────────────────────────────────────────
 # Health & Meta
 # ─────────────────────────────────────────
 

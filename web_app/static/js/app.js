@@ -54,10 +54,6 @@ function initOfflineProblemSwitcher() {
 }
 
 function switchView(viewId) {
-    if (isOfflineMode() && viewId === 'events') {
-        viewId = 'overview';
-    }
-
     // Update nav
     document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
     document.querySelector(`.nav-item[data-view="${viewId}"]`)?.classList.add('active');
@@ -78,11 +74,11 @@ function getViewTitle(viewId) {
         overview: '离线概览', metrics: '离线指标',
         logs: '离线日志', alerts: '告警中心', rca: '根因分析',
         traces: '离线链路', daemon: '守护进程',
-        alidata: 'AliData (阿里云)', events: '事件追踪'
+        alidata: 'AliData (阿里云)', events: '事件追踪', chat: '模型交互'
     } : {
         overview: '集群概览', metrics: '指标监控', logs: '日志查询',
         alerts: '告警中心', rca: '根因分析', traces: '链路追踪',
-        daemon: '守护进程', alidata: 'AliData (阿里云)', events: '事件追踪'
+        daemon: '守护进程', events: '事件追踪', chat: '模型交互', alidata: 'AliData (阿里云)'
     };
     return titles[viewId] || viewId;
 }
@@ -98,6 +94,7 @@ function refreshCurrentView() {
         daemon: loadDaemonStatus,
         alidata: loadAliDataView,
         events: () => { Promise.all([loadNamespaces('event-ns'), loadEvents()]); },
+        chat: initChatView,
     };
     (loaders[state.currentView] || (() => {}))();
 }
@@ -2659,10 +2656,9 @@ async function healthCheck() {
         badge.className = 'badge badge-success';
         badge.textContent = isOfflineMode() ? `离线: ${currentOfflineLabel()}` : '已连接';
         document.getElementById('view-title').textContent = getViewTitle(state.currentView);
-        if (eventsNav) eventsNav.style.display = isOfflineMode() ? 'none' : '';
+        if (eventsNav) eventsNav.style.display = '';
         if (isOfflineMode() && state.currentView === 'events') {
-            switchView('overview');
-            return;
+            // Allow events view in offline mode but show offline message
         }
 
         // LLM API Key check
@@ -2683,4 +2679,280 @@ async function healthCheck() {
     ) {
         refreshCurrentView();
     }
+}
+
+// ─────────────────────────────────────────
+// Model Chat (OpsLLM-7B)
+// ─────────────────────────────────────────
+
+const chatState = {
+    sessionId: 'default',
+    isStreaming: false,
+    messages: [],
+};
+
+async function initChatView() {
+    await loadModelInfo();
+    await loadChatHistory();
+    await loadChatSessions();
+
+    // Setup input listeners
+    const input = document.getElementById('chat-input');
+    if (input) {
+        input.addEventListener('input', () => {
+            autoResizeTextarea(input);
+            updateCharCount();
+        });
+    }
+}
+
+async function loadModelInfo() {
+    const statusEl = document.getElementById('chat-model-status');
+    if (!statusEl) return;
+
+    try {
+        const res = await fetch('/api/model/info');
+        const data = await res.json();
+
+        if (data && data.configured) {
+            statusEl.innerHTML = `
+                <span class="text-success">✅ 已连接</span> |
+                模型: <strong>${data.model || 'OpsLLM-7B'}</strong> |
+                端点: <code>${data.base_url || 'localhost:8888'}</code>
+            `;
+        } else {
+            statusEl.innerHTML = `
+                <span class="text-danger">❌ 未配置</span> — 请在 .env 中设置 LLM_API_KEY
+            `;
+        }
+    } catch (e) {
+        statusEl.innerHTML = `
+            <span class="text-danger">❌ 连接失败</span> — ${e.message}
+        `;
+    }
+}
+
+async function loadChatHistory() {
+    const data = await api(`/api/model/chat/history/${chatState.sessionId}`);
+    if (!data?.messages) return;
+
+    chatState.messages = data.messages;
+    renderChatMessages();
+}
+
+function renderChatMessages() {
+    const container = document.getElementById('chat-messages');
+    if (!container) return;
+
+    if (chatState.messages.length === 0) {
+        container.innerHTML = `
+            <div class="chat-welcome">
+                <div class="welcome-icon">🤖</div>
+                <h3>欢迎使用 OpsLLM-7B 智能运维助手</h3>
+                <p>我是基于 OpsLLM-7B 模型的 SRE 智能助手，可以帮助您：</p>
+                <div class="quick-actions">
+                    <button class="quick-action-btn" onclick="sendQuickMessage('如何排查 Pod 一直处于 Pending 状态的问题？')">
+                        🔧 Pod 故障排查
+                    </button>
+                    <button class="quick-action-btn" onclick="sendQuickMessage('如何分析 Kubernetes 集群的性能瓶颈？')">
+                        📊 性能分析
+                    </button>
+                    <button class="quick-action-btn" onclick="sendQuickMessage('告警风暴如何处理和优化？')">
+                        🔔 告警优化
+                    </button>
+                    <button class="quick-action-btn" onclick="sendQuickMessage('如何设计高可用的 Kubernetes 集群？')">
+                        🏗️ 架构设计
+                    </button>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = chatState.messages.map(msg => {
+        if (msg.role === 'user') {
+            return `<div class="chat-message user">
+                <div class="message-content">${escapeHtml(msg.content)}</div>
+            </div>`;
+        } else {
+            return `<div class="chat-message assistant">
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">${formatMarkdown(msg.content)}</div>
+            </div>`;
+        }
+    }).join('');
+
+    container.scrollTop = container.scrollHeight;
+}
+
+async function sendChatMessage() {
+    const input = document.getElementById('chat-input');
+    const message = input?.value?.trim();
+    if (!message || chatState.isStreaming) return;
+
+    input.value = '';
+    autoResizeTextarea(input);
+    updateCharCount();
+
+    chatState.messages.push({ role: 'user', content: message });
+    renderChatMessages();
+
+    const container = document.getElementById('chat-messages');
+    const loadingEl = document.createElement('div');
+    loadingEl.className = 'chat-message assistant loading';
+    loadingEl.id = 'chat-loading';
+    loadingEl.innerHTML = `
+        <div class="message-avatar">🤖</div>
+        <div class="message-content">
+            <span class="typing-indicator">
+                <span></span><span></span><span></span>
+            </span>
+        </div>
+    `;
+    container.appendChild(loadingEl);
+    container.scrollTop = container.scrollHeight;
+
+    chatState.isStreaming = true;
+    updateSendButton(true);
+
+    try {
+        const response = await fetch('/api/model/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                message: message,
+                session_id: chatState.sessionId,
+                stream: false,
+            }),
+        });
+
+        const data = await response.json();
+
+        if (data?.response) {
+            chatState.messages.push({ role: 'assistant', content: data.response });
+        } else if (data?.detail) {
+            chatState.messages.push({ role: 'assistant', content: `❌ 错误: ${data.detail}` });
+        }
+    } catch (e) {
+        chatState.messages.push({ role: 'assistant', content: `❌ 请求失败: ${e.message}` });
+    } finally {
+        const loading = document.getElementById('chat-loading');
+        if (loading) loading.remove();
+
+        chatState.isStreaming = false;
+        updateSendButton(false);
+        renderChatMessages();
+    }
+}
+
+function sendQuickMessage(message) {
+    const input = document.getElementById('chat-input');
+    if (input) {
+        input.value = message;
+        sendChatMessage();
+    }
+}
+
+function handleChatKeydown(event) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendChatMessage();
+    }
+}
+
+function autoResizeTextarea(textarea) {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 150) + 'px';
+}
+
+function updateCharCount() {
+    const input = document.getElementById('chat-input');
+    const countEl = document.getElementById('chat-char-count');
+    if (input && countEl) {
+        const len = input.value.length;
+        countEl.textContent = `${len} / 2000`;
+        countEl.style.color = len > 1800 ? 'var(--danger)' : 'var(--text-muted)';
+    }
+}
+
+function updateSendButton(loading) {
+    const btn = document.getElementById('chat-send-btn');
+    if (btn) {
+        btn.disabled = loading;
+        btn.innerHTML = loading
+            ? '<span class="loading-spinner"></span>'
+            : '<span class="send-icon">➤</span>';
+    }
+}
+
+async function clearChatHistory() {
+    if (!confirm('确定要清空当前对话记录吗？')) return;
+
+    await api(`/api/model/chat/history/${chatState.sessionId}`, { method: 'DELETE' });
+    chatState.messages = [];
+    renderChatMessages();
+}
+
+function exportChatHistory() {
+    if (chatState.messages.length === 0) {
+        alert('暂无对话记录可导出');
+        return;
+    }
+
+    const content = chatState.messages.map(m =>
+        `【${m.role === 'user' ? '用户' : '助手'}】\n${m.content}`
+    ).join('\n\n---\n\n');
+
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chat-export-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+async function loadChatSessions() {
+    const data = await api('/api/model/chat/sessions');
+    const container = document.getElementById('chat-sessions');
+    if (!container || !data?.sessions?.length) {
+        container.innerHTML = '<p class="text-muted">暂无历史对话</p>';
+        return;
+    }
+
+    container.innerHTML = data.sessions.map(s => `
+        <div class="chat-session-item ${s.session_id === chatState.sessionId ? 'active' : ''}"
+             onclick="switchChatSession('${s.session_id}')">
+            <span class="session-id">${s.session_id}</span>
+            <span class="session-meta">${s.message_count} 条消息</span>
+        </div>
+    `).join('');
+}
+
+function switchChatSession(sessionId) {
+    chatState.sessionId = sessionId;
+    loadChatHistory();
+    loadChatSessions();
+}
+
+function formatMarkdown(text) {
+    if (!text) return '';
+    let html = escapeHtml(text);
+
+    // Code blocks
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
+
+    // Inline code
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // Bold
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+    // Italic
+    html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+    // Line breaks
+    html = html.replace(/\n/g, '<br>');
+
+    return html;
 }
