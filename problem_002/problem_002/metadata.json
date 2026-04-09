@@ -1,9 +1,0 @@
-{
-  "problem_id": "002",
-  "time_range": "2025-09-16 23:20:33 ~ 2025-09-16 23:30:33",
-  "download_timestamp": "2025-10-31T12:21:44.699319",
-  "success_count": 5,
-  "total_tasks": 5,
-  "baseline_time_range": "2025-09-16 23:10:33 ~ 2025-09-16 23:19:33",
-  "force_refresh": false
-}
