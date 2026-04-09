@@ -33,8 +33,8 @@ kubernetes:
 observability:
   backend: "alidata"               # "native" (Prometheus/ES/Jaeger) | "alidata" (Alibaba ARMS/SLS)
   alidata_env_file: ".env"        # .env path with AliData credentials (only for alidata backend)
-  offline_mode: true             # true = alidata backend reads local problem_* data instead of Aliyun/MCP
-  offline_data_dir: "problem_002"
+  offline_mode: false             # true = alidata backend reads local problem_* data instead of Aliyun/MCP
+  offline_data_dir: "data"
   offline_problem_id: "002"
   offline_data_type: "failure"    # auto | baseline | failure
   prometheus_url: "http://localhost:9090"

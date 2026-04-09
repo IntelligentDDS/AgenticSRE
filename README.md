@@ -68,6 +68,8 @@ AgenticSRE 是一个面向通算与智算场景的高效率、可解释、自演
 
 ## 快速开始
 
+### 方式一：本地运行
+
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
@@ -77,13 +79,34 @@ cp configs/config.example.yaml configs/config.yaml
 # 编辑 config.yaml 配置LLM、K8s集群、可观测性后端
 
 # 3. 启动Web Dashboard
-cd web_app && ./start.sh
+cd web_app && ./run.sh
 
 # 4. 命令行模式
 python main.py --mode daemon     # 7×24持续监控
 python main.py --mode pipeline   # 单次Pipeline
 python main.py --mode rca --query "pod CrashLoopBackOff in namespace default"
 ```
+
+### 方式二：Docker 部署
+
+```bash
+# 1. 配置环境变量
+cp .env.example .env
+# 编辑 .env 填入 LLM API Key 等配置
+
+# 2. 一键部署
+bash deploy_docker.sh
+
+# 3. 重新构建镜像（修改代码后）
+bash deploy_docker.sh --build
+
+# 4. 停止服务
+bash deploy_docker.sh --stop
+```
+
+部署完成后访问 `http://localhost:8080` 即可使用 Web Dashboard。
+
+> **注意**：首次部署会自动构建 Docker 镜像（约 2-5 分钟）。如果存在 `agenticsre-image.tar.gz` 离线镜像包，将优先从包加载，使用 `--build` 参数可强制重新构建。
 
 ## AliData 离线模式
 
@@ -145,6 +168,9 @@ AgenticSRE/
 ├── main.py                  # 主入口
 ├── mcp_server.py            # MCP Server (Claude/Copilot集成)
 ├── requirements.txt         # Python依赖
+├── Dockerfile               # Docker镜像构建
+├── docker-compose.yaml      # Docker Compose编排
+├── deploy_docker.sh         # 一键Docker部署脚本
 ├── configs/                 # 配置文件
 ├── agents/                  # 智能体模块
 │   ├── alert_agent.py       # 告警压缩与根因推荐
